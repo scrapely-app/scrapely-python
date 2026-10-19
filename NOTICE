@@ -1,0 +1,11 @@
+scrapely-python
+Copyright (c) 2025-2026 TeraShift GmbH (Scrape.ly)
+
+Licensed under the MIT License (see LICENSE), except for the files below,
+which are derived from apify-sdk-python (https://github.com/apify/apify-sdk-python),
+Copyright Apify Technologies s.r.o., and remain under the Apache License,
+Version 2.0 (see LICENSE-APACHE). They have been modified by TeraShift GmbH:
+
+  - src/scrapely/events/_types.py
+  - src/scrapely/events/event_manager.py
+  - src/scrapely/request_loaders/_scrapely_request_list.py
