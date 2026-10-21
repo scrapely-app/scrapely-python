@@ -8,4 +8,10 @@ Version 2.0 (see LICENSE-APACHE). They have been modified by TeraShift GmbH:
 
   - src/scrapely/events/_types.py
   - src/scrapely/events/event_manager.py
+  - src/scrapely/log.py
   - src/scrapely/request_loaders/_scrapely_request_list.py
+  - src/scrapely/scrapy/ (all files)
+  - src/scrapely/storage/_file_system/_key_value_store_client.py
+  - src/scrapely/storage/_file_system/_storage_client.py
+  - src/scrapely/storage/smart_scrapely_storage_client.py
+  - src/scrapely/storage/utils.py

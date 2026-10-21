@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Derived from apify-sdk-python (src/apify/storage_clients/_file_system/_storage_client.py),
+# Copyright Apify Technologies s.r.o., licensed under the Apache License 2.0.
+# Modified by TeraShift GmbH. See LICENSE-APACHE and NOTICE.
 """Scrapely file-system StorageClient."""
 
 from __future__ import annotations

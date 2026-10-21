@@ -88,7 +88,7 @@ DEGRADED_STATUS_MESSAGE = "Site protection temporarily unavailable, results may 
 # Codes the platform answers with when a vendor cannot be solved right now.
 UNAVAILABLE_CODES = ("vendor_degraded", "vendor_down", "provider_unavailable", "vendor_unsupported", "solver_not_enabled")
 
-_COMPAT_SUFFIXES = ("/compat/v1", "/compat/xhrdev")
+_COMPAT_SUFFIXES = ("/compat/v1",)
 _STATUS_TTL_SECS = 15.0
 _MAX_BODY = 4 * 1024 * 1024
 

@@ -47,9 +47,32 @@ def is_storage_uuid(value: str) -> bool:
     return bool(STORAGE_UUID_REGEX.match(value))
 
 
+def path_segment(value: str) -> str:
+    """Percent-encode a value so it stays one URL path segment.
+
+    `''`, `.` and `..` are rejected: a URL parser resolves dot segments even when
+    percent-encoded, so the call would land on the parent resource.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f'Expected a string for a URL path segment, got {type(value).__name__}')
+    if value in ('', '.', '..'):
+        raise ValueError(f'"{value}" cannot be used as a URL path segment.')
+    return quote(value, safe='')
+
+
 def kvs_record_path(store_id: str, key: str) -> str:
     """Build a KVS record path with a URL-encoded key."""
-    return f'/v2/key-value-stores/{store_id}/records/{quote(key, safe="")}'
+    return f'/v2/key-value-stores/{store_id}/records/{path_segment(key)}'
+
+
+def rq_request_path(queue_id: str, request_id: str, suffix: str = '') -> str:
+    """Build the path of one queued request with the id URL-encoded.
+
+    Request ids come from queue contents, which another client may have written:
+    unencoded, an id such as `..` or `../../key-value-stores/x` would send the
+    call to another resource.
+    """
+    return f'/v2/request-queues/{queue_id}/requests/{path_segment(request_id)}{suffix}'
 
 
 def build_rq_params(
@@ -478,7 +501,7 @@ class ApiStorageClient:
 
     async def rq_get_request(self, queue_id: str, request_id: str) -> Optional[Request]:
         try:
-            data = await self.api_client.get_json(f'/v2/request-queues/{queue_id}/requests/{request_id}')
+            data = await self.api_client.get_json(rq_request_path(queue_id, request_id))
             return Request.from_dict(data)
         except ApiClientError as err:
             if err.status_code == 404:
@@ -523,7 +546,7 @@ class ApiStorageClient:
         payload = request.to_dict()
         payload['handledAt'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         data = await self.api_client.put_json(
-            f'/v2/request-queues/{queue_id}/requests/{request.id}',
+            rq_request_path(queue_id, request.id),
             payload,
             params=build_rq_params(client_key),
         )
@@ -561,12 +584,12 @@ class ApiStorageClient:
         # Persist retryCount/errorMessages before unlocking, so the next fetch
         # sees them and max_request_retries is ever reached.
         await self.api_client.put_json(
-            f'/v2/request-queues/{queue_id}/requests/{request.id}',
+            rq_request_path(queue_id, request.id),
             request.to_dict(),
             params=build_rq_params(client_key, forefront=forefront),
         )
         await self.api_client.delete(
-            f'/v2/request-queues/{queue_id}/requests/{request.id}/lock',
+            rq_request_path(queue_id, request.id, '/lock'),
             params=build_rq_params(client_key, forefront=forefront),
         )
         return ProcessedRequest(
@@ -601,7 +624,7 @@ class ApiStorageClient:
         )
 
     async def rq_delete_request(self, queue_id: str, request_id: str) -> None:
-        await self.api_client.delete(f'/v2/request-queues/{queue_id}/requests/{request_id}')
+        await self.api_client.delete(rq_request_path(queue_id, request_id))
 
     async def rq_prolong_request_lock(
         self,
@@ -614,7 +637,7 @@ class ApiStorageClient:
     ) -> Dict[str, Any]:
         """Prolong the lock on a request (REST API: PUT /requests/{id}/lock)."""
         data = await self.api_client.put_json(
-            f'/v2/request-queues/{queue_id}/requests/{request_id}/lock',
+            rq_request_path(queue_id, request_id, '/lock'),
             params=build_rq_params(client_key, lock_secs=lock_secs, forefront=forefront),
         )
         return {'lockExpiresAt': data.get('lockExpiresAt')}

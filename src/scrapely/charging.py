@@ -266,6 +266,12 @@ class ChargingManager:
         # Unresolved platform-billable intents: idempotency_key -> metadata.
         # Identity is the UUID key only — never keyed by event_name.
         self._pending_charge_keys: Dict[str, Dict[str, Any]] = {}
+        # Record in the run's default key-value store mirroring the unconfirmed
+        # charges, so a container crash does not lose them: settlement re-applies
+        # them under their own idempotency keys. One record per container, so a
+        # restarted container never overwrites its predecessor's.
+        self._pending_record_key = f'SCRAPELY_PENDING_CHARGES-{uuid.uuid4().hex[:12]}'
+        self._persisted_pending_sig = ''
         # Optional local charging-log dataset (ACTOR_USE_CHARGING_LOG_DATASET).
         self._charging_log_dataset: Any = None
         # Idempotency key of the last charge the platform accepted
@@ -285,6 +291,10 @@ class ChargingManager:
         # is still saved when that charge used up the spending limit. Push-then-
         # charge Actors never go positive, so they get nothing extra for free.
         self._prepaid_row_balance = 0
+        # Platform charges for results that were not stored and that the platform
+        # definitively refused to void (event -> count): they stay billed, so the
+        # next push of that event uses them instead of charging again.
+        self._void_refused_credit: Dict[str, int] = {}
 
     def close(self) -> None:
         """Mark the manager closed; subsequent charge/push operations are rejected."""
@@ -632,6 +642,45 @@ class ChargingManager:
         self._last_accepted_operation_id = None
         return op_id
 
+    async def _persist_pending_charges(self) -> None:
+        """Mirror the unconfirmed charges to the run's default key-value store.
+
+        Best effort, and only when the set changed since the last write.
+        """
+        if self._client is None or not self._is_at_home or not self._actor_run_id:
+            return
+        intents = [
+            {
+                'idempotencyKey': key,
+                'eventName': str(p.get('event_name') or ''),
+                'count': int(p.get('count', 0) or 0),
+                'createdAt': int(p.get('created_wall_ms') or time.time() * 1000),
+            }
+            for key, p in self._snapshot_pending()
+        ]
+        sig = ','.join(sorted(i['idempotencyKey'] for i in intents))
+        if sig == self._persisted_pending_sig:
+            return
+        store_id = (
+            os.environ.get('ACTOR_DEFAULT_KEY_VALUE_STORE_ID')
+            or os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID')
+            or self._config.get('default_key_value_store_id')
+        )
+        if not store_id or store_id == 'default':
+            return
+        try:
+            await asyncio.wait_for(
+                self._client.put(
+                    f'/v2/key-value-stores/{store_id}/records/{self._pending_record_key}',
+                    json_data={'v': 1, 'intents': intents},
+                    idempotent=True,
+                ),
+                timeout=15,
+            )
+            self._persisted_pending_sig = sig
+        except Exception as err:  # noqa: BLE001
+            logger.warning('Could not persist %s unconfirmed charge(s): %s', len(intents), err)
+
     async def _cancel_uncertain_charge(self, event_name: str, operation_id: str, reserved: int) -> bool:
         """Cancel an unconfirmed charge for items that were then not stored.
 
@@ -639,7 +688,58 @@ class ChargingManager:
         case the original request did apply; a 404 means it never applied.
         """
         self._drop_pending(operation_id)
-        return await self._void_charge(event_name, operation_id, reserved, not_found_means_voided=True)
+        voided = await self._void_charge(event_name, operation_id, reserved, not_found_means_voided=True)
+        # A persisted copy is harmless either way (the void leaves a tombstone),
+        # but keep the record small.
+        await self._persist_pending_charges()
+        return voided
+
+    async def _void_outcome(self, event_name: str, operation_id: str, reserved: int, uncertain: bool) -> str:
+        """Void (or cancel, when unconfirmed) a whole charge and say what happened.
+
+        ``'voided'``: the platform confirmed (local reservation released);
+        ``'stands'``: a definitive answer that it cannot be voided (charge stays);
+        ``'unknown'``: not confirmed, queued for retry (reservation kept).
+        """
+        queued = len(self._pending_voids)
+        if uncertain:
+            ok = await self._cancel_uncertain_charge(event_name, operation_id, reserved)
+        else:
+            ok = await self._void_charge(event_name, operation_id, reserved)
+        if ok:
+            return 'voided'
+        return 'unknown' if len(self._pending_voids) > queued else 'stands'
+
+    def _note_unvoidable(self, event_name: str, count: int) -> None:
+        """A charge for ``count`` unstored results stands (void refused): keep it as credit."""
+        if count <= 0:
+            return
+        self._void_refused_credit[event_name] = self._void_refused_credit.get(event_name, 0) + count
+        logger.warning(
+            'Charge for %s unstored %r result(s) could not be voided; the next push of %r uses it instead of charging again',
+            count,
+            event_name,
+            event_name,
+        )
+
+    def _take_void_credit(self, event_name: str, count: int) -> int:
+        """Use credit for a whole charge of ``count`` events (all or nothing); returns the count used."""
+        have = self._void_refused_credit.get(event_name, 0)
+        if count <= 0 or have < count:
+            return 0
+        self._void_refused_credit[event_name] = have - count
+        return count
+
+    def _return_void_credit(self, event_name: str, count: int) -> None:
+        if count > 0:
+            self._void_refused_credit[event_name] = self._void_refused_credit.get(event_name, 0) + count
+
+    async def _void_or_credit(self, event_name: str, operation_id: str, reserved: int, uncertain: bool) -> str:
+        """Void (or cancel) a charge for results that were not stored; a refused void becomes credit."""
+        outcome = await self._void_outcome(event_name, operation_id, reserved, uncertain)
+        if outcome == 'stands':
+            self._note_unvoidable(event_name, reserved)
+        return outcome
 
     async def _void_charge(
         self,
@@ -916,6 +1016,7 @@ class ChargingManager:
                 confirmed_total += confirmed
                 if confirmed == 0:
                     break
+        await self._persist_pending_charges()
         return confirmed_total
 
     async def charge(self, event_name: str, count: int = 1) -> ChargeResult:
@@ -1026,6 +1127,7 @@ class ChargingManager:
                 self._pending_charge_keys[idempotency_key] = {
                     'idempotency_key': idempotency_key,
                     'created_at': time.monotonic(),
+                    'created_wall_ms': int(time.time() * 1000),
                     'event_name': event_name,
                     'count': chargeable_count,
                 }
@@ -1086,6 +1188,9 @@ class ChargingManager:
                         or self._is_event_limit_reached(event_name),
                     )
             else:
+                # Not confirmed: keep a durable copy so a crash before the next
+                # flush cannot lose it (settlement re-applies it).
+                await self._persist_pending_charges()
                 raise ChargeUncertainError(
                     f'Charge for event {event_name!r} (count={chargeable_count}) '
                     f'was not confirmed by the platform; operation_id={idempotency_key}',
@@ -1349,6 +1454,12 @@ def _classify_charge_http_error(
             reason='charge-limit-exceeded' if status == 402 else f'http-{status}',
         )
 
+    # A 5xx / 408 / 429 answer is never a definitive rejection, whatever its text
+    # says: the charge may have applied, and only a retry with the same
+    # Idempotency-Key can tell (classifying it as rejected unwound the local
+    # count and the caller charged again under a new key).
+    if _is_transient_status(status if isinstance(status, int) else None):
+        return None
     message = str(err)
     if any(
         token in message.lower()
@@ -1369,6 +1480,20 @@ def _classify_charge_http_error(
             reason='message-match',
         )
     return None
+
+
+def _assert_items_serializable(items: List[Any]) -> None:
+    """Fail before anything is charged when an item cannot be sent to the dataset.
+
+    The storage client serializes items the same way (``json.dumps`` with
+    ``default=str``); an item it cannot serialize (e.g. a circular reference or
+    a non-string dict key) would otherwise fail the push after the charge.
+    """
+    for index, item in enumerate(items):
+        try:
+            json.dumps(item, ensure_ascii=False, default=str)
+        except (TypeError, ValueError) as err:
+            raise ValueError(f'Dataset item at index {index} is not serializable to JSON: {err}') from err
 
 
 async def push_data_and_charge(
@@ -1490,6 +1615,7 @@ async def push_data_and_charge(
         # Charge BEFORE persisting so a server cap/reject cannot leave unbilled
         # items in the dataset. Operation lock is held across both steps.
         if is_ppe and resolved_event:
+            _assert_items_serializable(limited_items)
             results: List[ChargeResult] = []
             default_event: Optional[str] = None
             if is_default_dataset:
@@ -1503,9 +1629,22 @@ async def push_data_and_charge(
             reserved_in_op: list[tuple[str, int]] = []
             operation_ids: list[Optional[str]] = []
             uncertain_ops: set[str] = set()
+            # Events of this push paid from credit (an earlier charge that could not be voided).
+            credit_used: list[int] = []
 
             async def charge_one(name: str) -> None:
                 charging_manager._take_last_accepted_operation_id()
+                credit = charging_manager._take_void_credit(name, len(limited_items))
+                if credit:
+                    results.append(ChargeResult(
+                        chargeable_within_limit=charging_manager.compute_chargeable(),
+                        charged_count=credit,
+                        event_charge_limit_reached=False,
+                    ))
+                    reserved_in_op.append((name, credit))
+                    operation_ids.append(None)
+                    credit_used.append(credit)
+                    return
                 try:
                     r = await charging_manager._charge_exclusive(name, len(limited_items))
                     op_id = charging_manager._take_last_accepted_operation_id()
@@ -1529,6 +1668,29 @@ async def push_data_and_charge(
                 results.append(r)
                 reserved_in_op.append((name, r.charged_count))
                 operation_ids.append(op_id)
+                credit_used.append(0)
+
+            async def undo_op(i: int, credit_if_stands: bool = True) -> str:
+                """Undo charge i of this operation: void a platform charge, unwind a local one.
+
+                A charge paid from credit gives the credit back. A platform charge
+                whose void is refused becomes credit (its results were not stored),
+                unless the caller handles that itself (``credit_if_stands=False``).
+                """
+                name, reserved = reserved_in_op[i]
+                op_id = operation_ids[i]
+                if reserved <= 0:
+                    return 'voided'
+                if credit_used[i]:
+                    charging_manager._return_void_credit(name, credit_used[i])
+                    credit_used[i] = 0
+                    return 'voided'
+                if op_id:
+                    if credit_if_stands:
+                        return await charging_manager._void_or_credit(name, op_id, reserved, op_id in uncertain_ops)
+                    return await charging_manager._void_outcome(name, op_id, reserved, op_id in uncertain_ops)
+                charging_manager._unwind_reservation(name, reserved)
+                return 'voided'
 
             try:
                 if default_event:
@@ -1536,51 +1698,101 @@ async def push_data_and_charge(
                 if event_name and event_name != default_event:
                     await charge_one(event_name)
             except Exception:
-                for name, reserved in reserved_in_op:
-                    if reserved > 0:
-                        charging_manager._unwind_reservation(name, reserved)
+                # A later event failed: undo the earlier ones, including charges the
+                # platform already accepted (voided there, not only unwound here).
+                for i in range(len(reserved_in_op)):
+                    await undo_op(i)
                 raise
 
-            if results:
-                # Pair each result with the event it reserved so we can unwind
-                # over-reservations when the min accepted count is lower.
-                charged_events: List[tuple[str, ChargeResult]] = []
-                if default_event:
-                    charged_events.append((default_event, results[0]))
-                if event_name and event_name != default_event:
-                    charged_events.append((event_name, results[-1]))
+            # One platform event accepted more than another (e.g. a configured,
+            # posted default-dataset event and the explicit event): only the
+            # smaller count of items is stored, so the larger charge is voided and
+            # charged again for exactly the stored count. A charge that cannot be
+            # voided (definitive answer) stays as before; one whose void is not
+            # confirmed yet fails the push so the caller retries it.
+            stood: set[int] = set()
+            for _round in range(3):
+                accepted_now = min(len(limited_items), *(r.charged_count for r in results)) if results else 0
+                excess = [
+                    i for i in range(len(results))
+                    if operation_ids[i] and i not in stood and results[i].charged_count > accepted_now
+                ]
+                if accepted_now <= 0 or not excess:
+                    break
+                for i in excess:
+                    name = reserved_in_op[i][0]
+                    # A refused void here keeps its stored share; the rest becomes credit below.
+                    outcome = await undo_op(i, credit_if_stands=False)
+                    if outcome == 'stands':
+                        stood.add(i)
+                        continue
+                    if outcome == 'unknown':
+                        for j in range(len(reserved_in_op)):
+                            if j != i:
+                                await undo_op(j)
+                        raise RuntimeError(
+                            'An earlier charge for a failed dataset push could not be voided yet; retry the push'
+                        )
+                    charging_manager._take_last_accepted_operation_id()
+                    try:
+                        r = await charging_manager._charge_exclusive(name, accepted_now)
+                        new_op = charging_manager._take_last_accepted_operation_id()
+                    except ChargeUncertainError as unconfirmed:
+                        r = ChargeResult(
+                            chargeable_within_limit=charging_manager.compute_chargeable(),
+                            charged_count=unconfirmed.count,
+                            event_charge_limit_reached=False,
+                        )
+                        new_op = unconfirmed.operation_id
+                        uncertain_ops.add(new_op)
+                    results[i] = r
+                    reserved_in_op[i] = (name, r.charged_count)
+                    operation_ids[i] = new_op
+                    credit_used[i] = 0
 
+            if results:
                 accepted_for_items = min(
                     len(limited_items),
                     *(result.charged_count for result in results),
                 )
                 # Unwind any event that reserved more than we will persist
                 # (synthetic default-dataset is local-only and otherwise sticks).
-                platform_op_names = {
-                    name for (name, _), op_id in zip(reserved_in_op, operation_ids) if op_id
-                }
-                for name, result in charged_events:
-                    if result.charged_count > accepted_for_items:
-                        # Nothing stored and a platform charge was made: the void
-                        # below releases its local count once the platform confirms.
-                        if accepted_for_items <= 0 and name in platform_op_names:
-                            continue
-                        charging_manager._unwind_reservation(
-                            name, result.charged_count - accepted_for_items
-                        )
+                for i, result in enumerate(results):
+                    name = reserved_in_op[i][0]
+                    over = result.charged_count - accepted_for_items
+                    if over <= 0:
+                        continue
+                    # Nothing stored and a platform charge was made: the void
+                    # below releases its local count once the platform confirms.
+                    if accepted_for_items <= 0 and operation_ids[i]:
+                        continue
+                    back = min(over, credit_used[i])
+                    if back:
+                        charging_manager._return_void_credit(name, back)
+                        credit_used[i] -= back
+                        reserved_in_op[i] = (name, reserved_in_op[i][1] - back)
+                    rest = over - back
+                    if rest <= 0:
+                        continue
+                    if i in stood:
+                        # The platform refused to void it: the unstored share stays billed.
+                        charging_manager._note_unvoidable(name, rest)
+                    else:
+                        charging_manager._unwind_reservation(name, rest)
                 if accepted_for_items <= 0:
                     # Nothing will be stored (another event of this push was capped
                     # to zero): undo every platform charge this operation made, so
                     # no result is billed for items that are never saved. Local
                     # counts were unwound just above.
-                    for (name, reserved), op_id in zip(reserved_in_op, operation_ids):
+                    for i, ((name, reserved), op_id) in enumerate(zip(reserved_in_op, operation_ids)):
+                        if credit_used[i]:
+                            charging_manager._return_void_credit(name, credit_used[i])
+                            reserved -= credit_used[i]
+                            credit_used[i] = 0
                         if reserved <= 0 or not op_id:
                             continue
                         # Original count: released only when the platform confirms.
-                        if op_id in uncertain_ops:
-                            await charging_manager._cancel_uncertain_charge(name, op_id, reserved)
-                        else:
-                            await charging_manager._void_charge(name, op_id, reserved)
+                        await charging_manager._void_or_credit(name, op_id, reserved, op_id in uncertain_ops)
                 if is_default_dataset and accepted_for_items < len(limited_items):
                     charging_manager._note_refused_default_dataset_items(
                         len(limited_items) - accepted_for_items
@@ -1602,15 +1814,19 @@ async def push_data_and_charge(
                         # timeout after sending may have stored the items.
                         if not _push_certainly_failed(push_err):
                             raise
-                        for (name, _), op_id in zip(reserved_in_op, operation_ids):
-                            kept = min(accepted_for_items, next(r.charged_count for n, r in charged_events if n == name))
+                        for i, ((name, _), op_id) in enumerate(zip(reserved_in_op, operation_ids)):
+                            kept = min(accepted_for_items, results[i].charged_count)
+                            if credit_used[i]:
+                                back = min(kept, credit_used[i])
+                                charging_manager._return_void_credit(name, back)
+                                credit_used[i] -= back
+                                kept -= back
                             if kept <= 0:
                                 continue
-                            if op_id and op_id in uncertain_ops:
-                                # Never re-post a charge for items that were not stored.
-                                await charging_manager._cancel_uncertain_charge(name, op_id, kept)
-                            elif op_id:
-                                await charging_manager._void_charge(name, op_id, kept)
+                            if op_id:
+                                # An unconfirmed charge is cancelled (never re-posted for
+                                # items that were not stored); a refused void becomes credit.
+                                await charging_manager._void_or_credit(name, op_id, kept, op_id in uncertain_ops)
                             elif is_default_dataset_item_event(name):
                                 charging_manager._unwind_reservation(name, kept)
                         raise
@@ -1707,6 +1923,7 @@ async def push_data_with_charges(
             return await _unpaid_push_locked(charging_manager, rows_in, is_default_dataset, push_fn)
         if not voids_confirmed and any(not is_default_dataset_item_event(n) for n in per_row):
             raise RuntimeError('An earlier charge for a failed dataset push could not be voided yet; retry the push')
+        _assert_items_serializable(rows_in)
 
         # Rows the budget can pay for in full (no one-event overdraw: a row is all or nothing).
         row_cost = sum(
@@ -1718,18 +1935,19 @@ async def push_data_with_charges(
             remaining = charging_manager._remaining_budget_usd()
             rows = min(rows, max(0, int(remaining / row_cost)))
 
-        ops: List[tuple] = []  # (event, charged, op_id, uncertain)
+        ops: List[tuple] = []  # (event, charged, op_id, uncertain, paid_from_credit)
 
         async def undo(entries: List[tuple]) -> None:
-            for name, charged, op_id, uncertain in entries:
+            for name, charged, op_id, uncertain, credit in entries:
                 if charged <= 0:
                     continue
-                if op_id is None:
+                if credit:
+                    charging_manager._return_void_credit(name, charged)
+                elif op_id is None:
                     charging_manager._unwind_reservation(name, charged)
-                elif uncertain:
-                    await charging_manager._cancel_uncertain_charge(name, op_id, charged)
                 else:
-                    await charging_manager._void_charge(name, op_id, charged)
+                    # Cancel / void; a refused void stays billed and becomes credit.
+                    await charging_manager._void_or_credit(name, op_id, charged, uncertain)
 
         for _attempt in range(6):
             if rows <= 0:
@@ -1739,15 +1957,19 @@ async def push_data_with_charges(
             for name, n in sorted(per_row.items(), key=lambda kv: (is_default_dataset_item_event(kv[0]), kv[0])):
                 want = n * rows
                 charging_manager._take_last_accepted_operation_id()
+                if charging_manager._take_void_credit(name, want):
+                    # Paid by an earlier charge whose results were not stored (void refused).
+                    ops.append((name, want, None, False, True))
+                    continue
                 try:
                     r = await charging_manager._charge_exclusive(name, want)
                     op_id = charging_manager._take_last_accepted_operation_id()
-                    ops.append((name, r.charged_count, op_id, False))
+                    ops.append((name, r.charged_count, op_id, False, False))
                     got = r.charged_count
                 except ChargeUncertainError as unconfirmed:
                     # Not confirmed: the intent stays pending and is re-posted at exit,
                     # so it counts as accepted (items stored, billed once).
-                    ops.append((name, unconfirmed.count, unconfirmed.operation_id, True))
+                    ops.append((name, unconfirmed.count, unconfirmed.operation_id, True, False))
                     got = unconfirmed.count
                 if got < want:
                     short_to = got // n
@@ -1763,7 +1985,7 @@ async def push_data_with_charges(
             # platform's remainingBudgetNd the local budget also knows the rest.
             attempt_spent = sum(
                 (charging_manager._calculate_event_price(name) or Decimal('0')) * Decimal(charged)
-                for name, charged, _op, _unc in ops
+                for name, charged, _op, _unc, _credit in ops
             )
             await undo(ops)
             ops = []
@@ -1854,7 +2076,8 @@ def _push_certainly_failed(err: BaseException) -> bool:
     """True when a dataset push certainly stored nothing.
 
     The storage API answered with an error status, or the connection was never
-    made. Timeouts and resets after sending are not proof: the write may have landed,
+    made (refused, connect timeout, no free pool connection). Timeouts and
+    resets after sending are not proof: the write may have landed,
     and neither is any error of a push one of whose earlier attempts may have been
     applied (``outcome_unknown``, set by the storage client's retries).
     """
@@ -1875,7 +2098,8 @@ def _push_certainly_failed(err: BaseException) -> bool:
         status = _http_status_of(e)
         if status is not None:
             return status >= 400
-        if isinstance(e, (httpx.ConnectError, ConnectionRefusedError)):
+        # Refused, or timed out before a connection / pool slot existed: nothing was sent.
+        if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, ConnectionRefusedError)):
             return True
         e = e.__cause__ or e.__context__
     return False

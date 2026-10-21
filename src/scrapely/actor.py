@@ -254,6 +254,14 @@ class _ClassProperty:
         return self.func(owner)
 
 
+def _system_exit_code(exc: Any) -> int:
+    """Process exit code carried by a SystemExit (sys.exit semantics)."""
+    code = getattr(exc, 'code', None)
+    if code is None:
+        return 0
+    return code if isinstance(code, int) else 1
+
+
 class _ActorMeta(type):
     """Metaclass enabling async with Actor: by delegating to classmethods."""
 
@@ -267,7 +275,11 @@ class _ActorMeta(type):
         return cls
 
     async def __aexit__(cls, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if exc_type is not None:
+        if exc_type is not None and issubclass(exc_type, SystemExit):
+            # Actor.exit()/fail()/sys.exit() inside `async with Actor:` is a deliberate
+            # exit, not a failure (Apify parity): keep its exit code, log nothing.
+            cls._exit_code = _system_exit_code(exc_val)
+        elif exc_type is not None:
             cls._exit_code = 1
             logger.error(f'Actor failed: {exc_val}')
         await cls._shutdown()
@@ -327,7 +339,10 @@ class Actor(metaclass=_ActorMeta):
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         cls = type(self)
-        if exc_type is not None:
+        if exc_type is not None and issubclass(exc_type, SystemExit):
+            # Deliberate exit via Actor.exit()/fail()/sys.exit(), not a failure.
+            cls._exit_code = _system_exit_code(exc_val)
+        elif exc_type is not None:
             cls._exit_code = 1
             logger.error(f'Actor failed: {exc_val}')
         else:
@@ -1741,10 +1756,10 @@ class Actor(metaclass=_ActorMeta):
 
         opts = options or MetamorphOptions()
 
-        # Wire format (server contract): the server copies the current INPUT to
-        # INPUT-METAMORPH-<n> itself and tracks the metamorph count in run
-        # stats; the new input (if any) is read from the request body's
-        # `input` field. targetActorId/build are accepted in the body.
+        # Wire format (server contract): the new input (if any) goes in the
+        # request body's `input` field; the server stores it as
+        # INPUT-METAMORPH-<n> (INPUT keeps the original) and tracks the
+        # metamorph count in run stats. targetActorId/build are accepted in the body.
         client = cls.new_client()
         body: Dict[str, Any] = {'targetActorId': target_actor_id}
         if opts.build:

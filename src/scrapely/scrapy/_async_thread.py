@@ -1,0 +1,209 @@
+# SPDX-License-Identifier: Apache-2.0
+# Derived from apify-sdk-python (src/apify/scrapy/_async_thread.py),
+# Copyright Apify Technologies s.r.o., licensed under the Apache License 2.0.
+# Modified by TeraShift GmbH. See LICENSE-APACHE and NOTICE.
+from __future__ import annotations
+
+import asyncio
+import threading
+from concurrent import futures
+from datetime import timedelta
+from logging import getLogger
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
+logger = getLogger(__name__)
+
+SUBMITTED_PRUNE_THRESHOLD = 128
+"""How many `submit_coro` futures may pile up before the finished ones are dropped from the tracking list."""
+
+
+class AsyncThread:
+    """Run an asyncio event loop in a dedicated background thread.
+
+    This lets synchronous Scrapy callbacks drive asynchronous Scrapely and Crawlee coroutines. The
+    scheduler and the HTTP cache storage each own their own `AsyncThread`, so the request queue and
+    the key-value store never share an event loop; they only share the read-only global
+    `Configuration`. A single shared loop would also work but would couple their lifecycles.
+    """
+
+    def __init__(self, default_timeout: timedelta = timedelta(seconds=60)) -> None:
+        self._default_timeout = default_timeout
+        self._eventloop = asyncio.new_event_loop()
+
+        self._submitted: list[futures.Future] = []
+        """Futures of the coroutines submitted via `submit_coro` that may still be running."""
+
+        # Start the event loop in a dedicated daemon thread.
+        self._thread = threading.Thread(
+            target=self._start_event_loop,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def run_coro(
+        self,
+        coro: Coroutine,
+        timeout: timedelta | Literal['default'] = 'default',
+    ) -> Any:
+        """Run a coroutine on an event loop running in a separate thread.
+
+        This method schedules the coroutine to run on the event loop and blocks until the coroutine completes
+        or the specified timeout is reached.
+
+        Args:
+            coro: The coroutine to run.
+            timeout: The maximum time to wait for the coroutine to finish. Pass `'default'` to use the
+                `default_timeout` passed to the constructor.
+
+        Returns:
+            The result returned by the coroutine.
+
+        Raises:
+            RuntimeError: If the event loop has been closed.
+            TimeoutError: If the coroutine does not complete within the timeout.
+            Exception: Any exception raised during coroutine execution.
+        """
+        if timeout == 'default':
+            timeout = self._default_timeout
+
+        if self._eventloop.is_closed():
+            raise RuntimeError(f'The coroutine {coro} cannot be executed because the event loop is closed.')
+
+        # Submit the coroutine to the event loop running in the other thread.
+        future = asyncio.run_coroutine_threadsafe(coro, self._eventloop)
+        try:
+            # Wait for the coroutine's result until the specified timeout.
+            return future.result(timeout=timeout.total_seconds())
+        except futures.TimeoutError:
+            # `future.result` gave up, but the coroutine keeps running on the loop; cancel it so it does
+            # not outlive the timeout. The propagated error is logged once by the caller (or Scrapy), so
+            # this method does not log it itself.
+            future.cancel()
+            raise
+
+    def submit_coro(self, coro: Coroutine) -> futures.Future:
+        """Schedule a coroutine on the event loop without waiting for its result.
+
+        Use this for work nothing depends on, so the calling thread is not blocked by the round trip. Failures
+        are logged, as there is no caller to propagate them to, and `close` cancels whatever is still pending -
+        call `wait_for_submitted` first if that matters.
+
+        Args:
+            coro: The coroutine to run.
+
+        Returns:
+            The future of the scheduled coroutine, for callers that want to inspect its outcome later.
+
+        Raises:
+            RuntimeError: If the event loop has been closed.
+        """
+        if self._eventloop.is_closed():
+            raise RuntimeError(f'The coroutine {coro} cannot be executed because the event loop is closed.')
+
+        # Callers may go a long time between `wait_for_submitted` calls, so without pruning the list would hold
+        # every coroutine ever submitted, with its result.
+        if len(self._submitted) >= SUBMITTED_PRUNE_THRESHOLD:
+            self._submitted = [submitted for submitted in self._submitted if not submitted.done()]
+
+        future = asyncio.run_coroutine_threadsafe(coro, self._eventloop)
+        future.add_done_callback(self._log_failure)
+        self._submitted.append(future)
+
+        return future
+
+    def wait_for_submitted(self, timeout: timedelta | None = None) -> None:
+        """Block until the coroutines submitted via `submit_coro` have finished.
+
+        Use this before anything that would observe their effects, or before `close`, which cancels whatever is
+        still running. Coroutines that do not finish within the timeout stay tracked for the next call.
+
+        Args:
+            timeout: The maximum time to wait for the submitted coroutines. Pass `None` to use the
+                `default_timeout` passed to the constructor.
+        """
+        if timeout is None:
+            timeout = self._default_timeout
+
+        self._submitted = list(futures.wait(self._submitted, timeout=timeout.total_seconds()).not_done)
+
+        # Callers rely on the effects having landed, so a timeout has to be visible.
+        if self._submitted:
+            logger.warning(f'{len(self._submitted)} submitted coroutines did not finish within the timeout.')
+
+    def close(self, timeout: timedelta | None = None) -> None:
+        """Close the event loop and its thread gracefully.
+
+        This method cancels all pending tasks, stops the event loop, and waits for the thread to exit.
+        If the thread does not exit within the given timeout, a forced shutdown is attempted.
+
+        Args:
+            timeout: The maximum time to wait for the event loop thread to exit. Pass `None` to use the
+                `default_timeout` passed to the constructor.
+        """
+        if timeout is None:
+            timeout = self._default_timeout
+
+        # A repeated close (e.g. a retried shutdown) would call into the already-closed loop and raise
+        # `RuntimeError: Event loop is closed`. The loop closes itself once it stops, so a second close
+        # is a no-op.
+        if self._eventloop.is_closed():
+            return
+
+        try:
+            if self._eventloop.is_running():
+                # Cancel all pending tasks in the event loop, honouring the caller's timeout.
+                self.run_coro(self._shutdown_tasks(), timeout=timeout)
+        finally:
+            # Stop the loop and join its thread even if cancelling the pending tasks above raised or timed
+            # out. Skipping this would leave the loop running and leak its thread.
+            self._eventloop.call_soon_threadsafe(self._eventloop.stop)
+
+            # Wait for the event loop thread to finish execution.
+            self._thread.join(timeout=timeout.total_seconds())
+
+            # If the thread is still running after the timeout, force a shutdown.
+            if self._thread.is_alive():
+                logger.warning('Event loop thread did not exit cleanly! Forcing shutdown...')
+                self._force_exit_event_loop()
+
+    @staticmethod
+    def _log_failure(future: futures.Future) -> None:
+        """Log the failure of a coroutine submitted via `submit_coro`."""
+        if future.cancelled():
+            return
+
+        if (exc := future.exception()) is not None:
+            logger.error('A coroutine submitted to the event loop failed.', exc_info=exc)
+
+    def _start_event_loop(self) -> None:
+        """Set up and run the asyncio event loop in the dedicated thread."""
+        asyncio.set_event_loop(self._eventloop)
+        try:
+            self._eventloop.run_forever()
+        finally:
+            self._eventloop.close()
+            logger.debug('Asyncio event loop has been closed.')
+
+    async def _shutdown_tasks(self) -> None:
+        """Cancel all pending tasks in the event loop."""
+        # Retrieve all tasks for the event loop, excluding the current task.
+        tasks = [task for task in asyncio.all_tasks(self._eventloop) if task is not asyncio.current_task()]
+
+        # Cancel each pending task.
+        for task in tasks:
+            task.cancel()
+
+        # Wait until all tasks have been cancelled or finished.
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _force_exit_event_loop(self) -> None:
+        """Shut down the event loop and its thread forcefully."""
+        try:
+            logger.info('Forced shutdown of the event loop and its thread...')
+            self._eventloop.call_soon_threadsafe(self._eventloop.stop)
+            self._thread.join(timeout=5)
+        except Exception:
+            logger.exception('Exception occurred during forced event loop shutdown.')

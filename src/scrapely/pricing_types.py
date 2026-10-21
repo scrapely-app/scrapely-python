@@ -26,11 +26,6 @@ class BasePricingInfo(BaseModel):
     """Base class for pricing information."""
     model_config = ConfigDict(populate_by_name=True)
     
-    apify_margin_percentage: Optional[float] = Field(
-        default=None,
-        alias='apifyMarginPercentage',
-        description="The platform's margin on the price, as a percentage."
-    )
     created_at: Optional[datetime] = Field(
         default=None,
         alias='createdAt',
