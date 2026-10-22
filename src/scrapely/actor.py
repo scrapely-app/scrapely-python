@@ -925,7 +925,14 @@ class Actor(metaclass=_ActorMeta):
 
     # Debug capture: raw source payloads for platform diagnostics. Only active when the platform
     # sets SCRAPELY_DEBUG_CAPTURE=1 on its own diagnostic runs; a no-op in every other run.
+    # A payload up to _DEBUG_CAPTURE_MAX_BYTES characters is stored as it is; a larger one gzip-compressed
+    # (base64, at most _DEBUG_CAPTURE_MAX_BYTES characters again), keeping up to _DEBUG_CAPTURE_MAX_CHARS
+    # characters / _DEBUG_CAPTURE_MAX_ENCODED bytes of it. A plain cut at 256 KiB lost the part a check
+    # needed when a large API document starts with site navigation (the seller section of a 581 KB
+    # listing JSON sat at ~333 KB).
     _DEBUG_CAPTURE_MAX_BYTES = 256 * 1024
+    _DEBUG_CAPTURE_MAX_CHARS = 8 * 1024 * 1024
+    _DEBUG_CAPTURE_MAX_ENCODED = 8 * 1024 * 1024
     _DEBUG_CAPTURE_MAX_RECORDS = 500
     _debug_capture_count = 0
 
@@ -967,14 +974,32 @@ class Actor(metaclass=_ActorMeta):
         if cls._debug_capture_count >= cls._DEBUG_CAPTURE_MAX_RECORDS:
             return
         try:
-            text = payload if isinstance(payload, str) else json.dumps(payload, default=str, ensure_ascii=False)
-            if isinstance(text, bytes):
-                text = text.decode('utf-8', 'replace')
-            text = text[: cls._DEBUG_CAPTURE_MAX_BYTES]
+            if isinstance(payload, (bytes, bytearray)):
+                text = bytes(payload).decode('utf-8', 'replace')
+            elif isinstance(payload, str):
+                text = payload
+            else:
+                text = json.dumps(payload, default=str, ensure_ascii=False, separators=(',', ':'))
+            record = cls._debug_capture_record(str(key), text)
             cls._debug_capture_count += 1
-            await cls.set_value(cls.debug_capture_record_key(key), {'key': str(key), 'payload': text})
+            await cls.set_value(cls.debug_capture_record_key(key), record)
         except Exception as err:  # never break the run
             logging.getLogger('scrapely').debug('debug_capture failed: %s', err)
+
+    @classmethod
+    def _debug_capture_record(cls, key: str, text: str) -> Dict[str, Any]:
+        """The record for one capture: plain when small, else gzip-base64 (plain head as the last resort)."""
+        limit = cls._DEBUG_CAPTURE_MAX_BYTES
+        if len(text) <= limit:
+            return {'key': key, 'payload': text}
+        import gzip
+        raw = text[: cls._DEBUG_CAPTURE_MAX_CHARS].encode('utf-8')
+        kept = raw[: cls._DEBUG_CAPTURE_MAX_ENCODED]
+        packed = base64.b64encode(gzip.compress(kept, 6)).decode('ascii')
+        if len(packed) <= limit:
+            truncated = len(text) > cls._DEBUG_CAPTURE_MAX_CHARS or len(kept) < len(raw)
+            return {'key': key, 'payload': packed, 'encoding': 'gzip-base64', 'length': len(text), 'truncated': truncated}
+        return {'key': key, 'payload': text[:limit], 'length': len(text), 'truncated': True}
 
     @classmethod
     def _resolve_open_args(

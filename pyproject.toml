@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scrapely-python"
-version = "0.1.32"
+version = "0.1.33"
 description = "Scrapely Python SDK - A toolkit for building Actors on the Scrapely platform"
 readme = "README.md"
 license = "MIT AND Apache-2.0"
