@@ -285,6 +285,53 @@ class _ActorMeta(type):
         await cls._shutdown()
 
 
+
+def _element_markup(obj: Any) -> Optional[str]:
+    """The markup of a parsed XML/HTML element, or None when ``obj`` is not one.
+
+    Debug captures store the source an item was read from. Feed and page parsers hand over elements
+    (xml.etree / lxml elements and trees, BeautifulSoup tags, selectolax nodes, parsel / Scrapy
+    selectors); their ``str()`` is only a repr such as ``<Element 'change' at 0x...>``, which shows
+    nothing of the source. Optional parsers are recognised by module, never imported here.
+    """
+    import xml.etree.ElementTree as ET
+
+    if isinstance(obj, ET.ElementTree):
+        root = obj.getroot()
+        return ET.tostring(root, encoding='unicode') if root is not None else ''
+    if isinstance(obj, ET.Element):
+        if obj.tail:  # the text after the element belongs to its parent, as with lxml's with_tail=False
+            import copy
+
+            obj = copy.copy(obj)
+            obj.tail = None
+        return ET.tostring(obj, encoding='unicode')
+    modules = [getattr(c, '__module__', '') or '' for c in type(obj).__mro__]
+    if any(m == 'lxml' or m.startswith('lxml.') for m in modules):
+        from lxml import etree  # type: ignore[import-not-found]
+
+        out = etree.tostring(obj, encoding='unicode', with_tail=False)
+        return out if isinstance(out, str) else None
+    if any(m == 'bs4' or m.startswith('bs4.') for m in modules):
+        return str(obj)
+    if any(m == 'selectolax' or m.startswith('selectolax.') for m in modules):
+        html = getattr(obj, 'html', None)
+        return html if isinstance(html, str) else None
+    if any(m == 'parsel' or m.startswith('parsel.') for m in modules) and callable(getattr(obj, 'get', None)):
+        out = obj.get()
+        return out if isinstance(out, str) else None
+    return None
+
+
+def _capture_json_default(obj: Any) -> Any:
+    """json.dumps fallback for debug captures: elements as their markup, anything else as str()."""
+    try:
+        markup = _element_markup(obj)
+    except Exception:  # an unusual node type must not lose the rest of the payload
+        markup = None
+    return markup if markup is not None else str(obj)
+
+
 class Actor(metaclass=_ActorMeta):
     """Core class for building Actors on the Scrapely platform."""
 
@@ -974,12 +1021,15 @@ class Actor(metaclass=_ActorMeta):
         if cls._debug_capture_count >= cls._DEBUG_CAPTURE_MAX_RECORDS:
             return
         try:
-            if isinstance(payload, (bytes, bytearray)):
+            markup = _element_markup(payload)
+            if markup is not None:
+                text = markup
+            elif isinstance(payload, (bytes, bytearray)):
                 text = bytes(payload).decode('utf-8', 'replace')
             elif isinstance(payload, str):
                 text = payload
             else:
-                text = json.dumps(payload, default=str, ensure_ascii=False, separators=(',', ':'))
+                text = json.dumps(payload, default=_capture_json_default, ensure_ascii=False, separators=(',', ':'))
             record = cls._debug_capture_record(str(key), text)
             cls._debug_capture_count += 1
             await cls.set_value(cls.debug_capture_record_key(key), record)
