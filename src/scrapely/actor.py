@@ -349,6 +349,10 @@ class Actor(metaclass=_ActorMeta):
     _cached_input: Optional[Dict[str, Any]] = None
     _exit_code: int = 0
     _status_message: Optional[str] = None
+    # Set by fail() for the rest of the lifecycle: (exit code, status message).
+    # A later exit() keeps them, so `fail()` followed by the usual `exit()` in a
+    # `finally:` block still ends the run as FAILED (it used to exit with 0).
+    _failure: Optional[Tuple[int, Optional[str]]] = None
     _charging_manager: Optional[ChargingManager] = None
     _use_state_stores: set = set()
     # Lifecycle bookkeeping set in init() / cleared in _shutdown().
@@ -392,9 +396,11 @@ class Actor(metaclass=_ActorMeta):
         elif exc_type is not None:
             cls._exit_code = 1
             logger.error(f'Actor failed: {exc_val}')
+        elif cls._failure is not None:
+            cls._exit_code = cls._failure[0]  # fail(exit=False) earlier: the run stays failed
         else:
             cls._exit_code = self._instance_exit_code
-        if self._instance_status_message:
+        if self._instance_status_message and cls._failure is None:
             cls._status_message = self._instance_status_message
             await cls._persist_terminal_status_message(self._instance_status_message)
         await cls._shutdown(timeout_secs=int(self._cleanup_timeout.total_seconds()))
@@ -410,6 +416,7 @@ class Actor(metaclass=_ActorMeta):
         cls._main_loop = asyncio.get_running_loop()  # for debug_capture_sync from worker threads
         if cls._initialized:
             return
+        cls._failure = None  # a new lifecycle starts unfailed
 
         if options is None or options.configure_logging:
             _lazy('_configure_logging')()
@@ -701,13 +708,33 @@ class Actor(metaclass=_ActorMeta):
         if exit_code is not None:
             opts.exit_code = exit_code
 
-        if opts.status_message:
+        if cls._failure is not None:
+            # Actor.fail() already ran: the run stays failed. Keep its exit code and
+            # status message; a later exit() (e.g. in a `finally:` block) only
+            # finishes the shutdown and exits with the failure's code.
+            if opts.status_message:
+                logger.info(f'[Scrapely] {opts.status_message}')
+            logger.info(
+                '[Scrapely] Actor.exit() after Actor.fail(): the run stays failed (exit code %s).',
+                cls._failure[0],
+            )
+            opts = ExitOptions(**{**opts.__dict__})
+            opts.exit_code, opts.status_message = cls._failure
+            await cls._exit_with(opts, persist_message=False)
+            return
+
+        await cls._exit_with(opts)
+
+    @classmethod
+    async def _exit_with(cls, opts: ExitOptions, persist_message: bool = True) -> None:
+        if opts.status_message and persist_message:
             logger.info(f'[Scrapely] {opts.status_message}')
 
         cls._exit_code = opts.exit_code
         cls._status_message = opts.status_message
 
-        await cls._persist_terminal_status_message(opts.status_message)
+        if persist_message:
+            await cls._persist_terminal_status_message(opts.status_message)
         await cls._shutdown(timeout_secs=opts.timeout_secs)
 
         if opts.exit:
@@ -736,7 +763,7 @@ class Actor(metaclass=_ActorMeta):
         if isinstance(message_or_options, str):
             opts = ExitOptions(exit_code=1, status_message=message_or_options)
         else:
-            # Options-object form: an explicit exit_code in the object wins over
+            # Options-object form: a non-zero exit_code in the object wins over
             # the fail() default of 1 (JS SDK semantics). Build the dict first —
             # passing it alongside exit_code=1 as kwargs raises
             # "got multiple values for keyword argument 'exit_code'".
@@ -751,12 +778,24 @@ class Actor(metaclass=_ActorMeta):
             opts.status_message = status_message
         if exit_code is not None:
             opts.exit_code = exit_code
+        elif not opts.exit_code:
+            # ExitOptions always carries exit_code (default 0), so 0 from an options
+            # object means "not set": a failed run must not exit with 0. Only an
+            # explicit exit_code=0 keyword keeps 0.
+            opts.exit_code = 1
 
         logger.error(
             f'[Scrapely] Actor failed: {opts.status_message or "Unknown error"}',
             exc_info=exception,
         )
-        await cls.exit(opts)
+        if cls._failure is not None:
+            # Failed already: the first failure's code and message stay.
+            opts = ExitOptions(**{**opts.__dict__})
+            opts.exit_code, opts.status_message = cls._failure
+            await cls._exit_with(opts, persist_message=False)
+            return
+        cls._failure = (opts.exit_code, opts.status_message)
+        await cls._exit_with(opts)
 
     @classmethod
     def is_at_home(cls) -> bool:
