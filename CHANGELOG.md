@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.36] - 2026-10-26
+
+- Opening a named dataset, key-value store or request queue (`Actor.open_dataset('name')` and the like) retries when the API answers `503 storage-name-busy`. The API sends it when another request kept creating or renaming a storage of that name for over 15 s; nothing was changed, so the open is simply repeated. It used to fail the open.
+
 ## [0.1.35] - 2026-10-26
 
 - Once `Actor.fail()` has run, the run stays failed. A later `Actor.exit()` keeps the failure's exit code and status message, so the usual `try: ... await Actor.fail(...) finally: await Actor.exit()` pattern now ends the run as FAILED. Before, the `exit()` in `finally` replaced the failure's exit code 1 with 0 and the run ended as SUCCEEDED with the failure message as its status. The same holds after `fail()` whose `SystemExit` was caught, after `fail(ExitOptions(exit=False))` (also inside `async with Actor(...)` and `Actor.main()`), and for a second `fail()`, which keeps the first failure's code and message.

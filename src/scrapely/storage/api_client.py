@@ -40,11 +40,13 @@ def is_retryable_response(
 
     429 always: the run API limiter and dataset backpressure refuse it before
     anything is written. Idempotent methods: also 500/502/503/504. Others
-    (dataset push, KV PUT) only on a 503 that certainly was not processed: the
-    rate limiter refused it ("rate-limit-unavailable", before the handler), or
-    HAProxy had no backend (its own page, nothing forwarded). Any other 503 may
-    mean "outcome unknown" (a direct dataset write whose commit was not
-    confirmed), and re-sending could store the items twice.
+    (dataset push, KV PUT, named storage create) only on a 503 that certainly
+    was not processed: the rate limiter refused it ("rate-limit-unavailable",
+    before the handler), another request held the storage name
+    ("storage-name-busy", nothing changed), or HAProxy had no backend (its own
+    page, nothing forwarded). Any other 503 may mean "outcome unknown" (a
+    direct dataset write whose commit was not confirmed), and re-sending could
+    store the items twice.
     """
     if status == 429:
         return True
@@ -52,7 +54,7 @@ def is_retryable_response(
         return status in (500, 502, 503, 504)
     if status != 503:
         return False
-    return error_type == 'rate-limit-unavailable' or NO_BACKEND_MARKER in (body_text or '')
+    return error_type in ('rate-limit-unavailable', 'storage-name-busy') or NO_BACKEND_MARKER in (body_text or '')
 
 
 def unwrap_data(value: Any) -> Any:
