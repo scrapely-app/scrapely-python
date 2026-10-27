@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scrapely-python"
-version = "0.1.36"
+version = "0.1.38"
 description = "Scrapely Python SDK - A toolkit for building Actors on the Scrapely platform"
 readme = "README.md"
 license = "MIT AND Apache-2.0"
 license-files = ["LICENSE", "LICENSE-APACHE", "NOTICE"]
 authors = [
-    {name = "Scrapely", email = "support@scrape.ly"}
+    {name = "Scrapely", email = "hello@scrape.ly"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -31,6 +31,7 @@ dependencies = [
     "scrapely-client-python>=1.0.2,<2",
     "pydantic>=2.0.0",
     "cryptography>=42.0.0",
+    "wreq>=0.13,<0.14; python_version>='3.11'",
 ]
 
 [project.optional-dependencies]
@@ -56,7 +57,7 @@ Changelog = "https://github.com/scrapely-app/scrapely-python/blob/main/CHANGELOG
 where = ["src"]
 
 [tool.setuptools.package-data]
-scrapely = ["py.typed"]
+scrapely = ["py.typed", "http/profiles.json"]
 
 [tool.black]
 line-length = 100
@@ -85,3 +86,5 @@ strict_equality = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["network: needs internet access (run with -m network)"]
+addopts = "-m 'not network'"
