@@ -198,6 +198,7 @@ class Identity:
     retired: bool = False
     in_flight: int = 0  # requests using it right now (a session's identity is shared)
     closed: bool = False
+    country: Optional[str] = None  # exit country requested from the proxy, when known
 
     def expired(self, now: float, max_usage: int, max_age: float) -> bool:
         if self.retired:

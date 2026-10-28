@@ -308,7 +308,8 @@ class ChargingManager:
 
     def _remaining_budget_usd(self) -> Decimal:
         """maxTotalChargeUsd minus this SDK's charges and the platform's other run spend."""
-        assert self._max_total_charge_usd is not None
+        if self._max_total_charge_usd is None:
+            raise RuntimeError('maxTotalChargeUsd is not set')
         return self._max_total_charge_usd - self._total_charged_usd - self._platform_other_usd
 
     def _sync_platform_budget(self) -> None:

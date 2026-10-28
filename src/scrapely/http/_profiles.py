@@ -39,6 +39,10 @@ class BrowserProfile:
     weight: float
     headers: Dict[str, str] = field(default_factory=dict, compare=False, hash=False)
     note: str = field(default='', compare=False, hash=False)
+    # Headers whose value differs from the backend profile's own default
+    # (a newer browser version on the same TLS/HTTP2 profile: User-Agent,
+    # client hints, Accept). They are sent explicitly on every request.
+    header_overrides: Tuple[str, ...] = field(default=(), compare=False, hash=False)
 
     @property
     def label(self) -> str:
@@ -83,6 +87,7 @@ def _parse_table(raw: Dict[str, Any]) -> ProfileTable:
                 weight=float(row.get('weight') or 0.0),
                 headers={k.lower(): v for k, v in (row.get('headers') or {}).items()},
                 note=row.get('note') or '',
+                header_overrides=tuple(h.lower() for h in (row.get('header_overrides') or ())),
             )
         )
     return ProfileTable(

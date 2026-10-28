@@ -27,7 +27,9 @@ class ApiClientError(Exception):
 
 
 # PUT is left out: a KV record PUT is counted (and billed) as a write each time
-# it is applied, so a lost response must not be re-sent blindly.
+# it is applied, so a lost response must not be re-sent blindly. Record PUTs
+# carry an Idempotency-Key instead (see is_kv_record_url), which the API
+# de-duplicates, so they are re-sent after a lost answer (e.g. an edge 502).
 IDEMPOTENT_METHODS = frozenset({'GET', 'HEAD', 'DELETE', 'OPTIONS'})
 # HAProxy's own 503 page: no backend was available, so nothing was forwarded.
 NO_BACKEND_MARKER = 'No server is available to handle this request'
@@ -94,20 +96,40 @@ _keyed_writes_deduped: Dict[str, bool] = {}
 _keyed_writes_override: Optional[bool] = None
 
 
+def is_kv_record_url(url: str) -> bool:
+    """A key-value store record URL (``.../key-value-stores/<id>/records/<key>``)."""
+    try:
+        path = httpx.URL(url).path
+    except Exception:
+        path = url
+    return '/key-value-stores/' in path and '/records/' in path
+
+
 def _origin_of(url: str) -> str:
+    """What is learned per API: its origin, separately for record PUTs and other keyed writes."""
     try:
         u = httpx.URL(url)
-        return f'{u.scheme}://{u.netloc.decode()}'
+        origin = f'{u.scheme}://{u.netloc.decode()}'
     except Exception:
-        return url
+        origin = url
+    return origin + '#kv-record' if is_kv_record_url(url) else origin
 
 
 def api_dedupes_keyed_writes(url: Optional[str] = None) -> bool:
-    """Whether the API at ``url`` (default: the last one seen) de-duplicates keyed writes."""
+    """Whether the API at ``url`` (default: the last one seen) de-duplicates keyed writes.
+
+    Record PUTs count as de-duplicated until a keyed record PUT was stored
+    without the support header: re-applying the same body to the same record
+    leaves the same record, so the worst case on an API that ignores the key
+    is one extra counted write, while not re-sending fails the run.
+    """
     if _keyed_writes_override is not None:
         return _keyed_writes_override
     if url is not None:
-        return _keyed_writes_deduped.get(_origin_of(url)) is True
+        learned = _keyed_writes_deduped.get(_origin_of(url))
+        if learned is None and is_kv_record_url(url):
+            return True
+        return learned is True
     return bool(_keyed_writes_deduped) and list(_keyed_writes_deduped.values())[-1] is True
 
 
@@ -537,6 +559,7 @@ class ApiClient:
         *,
         raise_for_status: bool = True,
         idempotent: Optional[bool] = None,
+        idempotency_key: Optional[str] = None,
     ) -> httpx.Response:
         return await self.request(
             'PUT',
@@ -547,6 +570,7 @@ class ApiClient:
             headers=headers,
             raise_for_status=raise_for_status,
             idempotent=idempotent,
+            idempotency_key=idempotency_key,
         )
 
     async def delete(

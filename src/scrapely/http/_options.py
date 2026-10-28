@@ -99,16 +99,16 @@ class FingerprintOptions:
     """Which browsers, operating systems, devices and locales a client may present.
 
     All fields are optional. The defaults are desktop Chrome on Windows, macOS
-    and Linux (weighted toward real traffic), with Accept-Language taken from
-    the proxy country.
+    and Linux (weighted toward real traffic), with Accept-Language matching
+    each identity's exit country.
 
     Attributes:
         browsers: ``"chrome"``, ``"edge"``, ``"firefox"``, ``"safari"``, or
             ``{"name": "chrome", "min_version": 150}``.
         operating_systems: ``"windows"``, ``"macos"``, ``"linux"``, ``"android"``, ``"ios"``.
         devices: ``"desktop"`` (default) and/or ``"mobile"``.
-        locales: e.g. ``["de-DE"]``; the first is the primary language. Wins over
-            the proxy country.
+        locales: e.g. ``["de-DE"]``. Each identity uses one of them, as a
+            browser has one language setup. Wins over the proxy country.
         strict: only profiles whose fingerprint was verified against the real
             browser, and fail instead of relaxing options that match nothing.
         http_version: ``"2"`` (default) or ``"1"`` to force HTTP/1.1.

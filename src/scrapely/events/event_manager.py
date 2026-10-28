@@ -122,13 +122,15 @@ class ScrapelyEventManager(CrawleeEventManager):
         # Run tasks but don't await them
         ws_url = self._configuration.get('actor_events_ws_url')
         if ws_url:
-            # Append authentication parameters to the WebSocket URL
-            # This matches the Node SDK behavior in events-client.ts
+            # Authenticate with the token in a header and the runId in the URL (URLs end up in access
+            # logs). This matches the Node SDK behavior in events-client.ts
             token = self._configuration.get('token')
             run_id = self._configuration.get('actor_run_id')
+            headers: dict[str, str] = {}
             if token and run_id:
                 separator = '&' if '?' in ws_url else '?'
-                ws_url = f"{ws_url}{separator}{urlencode({'token': token, 'runId': run_id})}"
+                ws_url = f"{ws_url}{separator}{urlencode({'runId': run_id})}"
+                headers['Authorization'] = f'Bearer {token}'
                 logger.debug(f'Connecting to platform events websocket with runId={run_id}')
             else:
                 logger.warning(
@@ -139,7 +141,7 @@ class ScrapelyEventManager(CrawleeEventManager):
             # Connect in the background without blocking init, matching the Node SDK: a slow or failed
             # connection is retried and must not crash the Actor.
             self._process_platform_messages_task = asyncio.create_task(
-                self._process_platform_messages(ws_url)
+                self._process_platform_messages(ws_url, headers)
             )
         else:
             logger.debug(
@@ -170,7 +172,7 @@ class ScrapelyEventManager(CrawleeEventManager):
 
         await super().__aexit__(exc_type, exc_value, exc_traceback)
 
-    async def _process_platform_messages(self, ws_url: str) -> None:
+    async def _process_platform_messages(self, ws_url: str, headers: Optional[dict[str, str]] = None) -> None:
         """Process messages from the platform WebSocket with reconnect logic."""
         try:
             import websockets.asyncio.client
@@ -189,7 +191,7 @@ class ScrapelyEventManager(CrawleeEventManager):
         try:
             # Used as an async iterator, `connect` reconnects with exponential backoff on failed connection attempts,
             # including the first one (timeouts, network errors and 5xx responses are retried).
-            async for websocket in websockets.asyncio.client.connect(ws_url):
+            async for websocket in websockets.asyncio.client.connect(ws_url, additional_headers=headers or None):
                 self._platform_events_websocket = websocket
                 if self._connected_to_platform_websocket and not self._connected_to_platform_websocket.done():
                     self._connected_to_platform_websocket.set_result(True)

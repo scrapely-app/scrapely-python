@@ -631,11 +631,26 @@ class ProxyConfiguration:
             result = await result
         return cast(str, result)
 
+    def _can_pick_country(self) -> bool:
+        """True when each URL may get its own exit country (``new_url(country_code=...)``).
+
+        Only for the plain platform proxy with no country set, no custom or
+        tiered URLs and no datacenter group: the datacenter pool exits in the
+        US only, and a datacenter request pinned to another country is routed
+        and billed as residential.
+        """
+        if self._country_code or self._subdivision_code or self._proxy_urls or self._tiered_proxy_urls or self._new_url_function:
+            return False
+        if not self._needs_platform:
+            return False
+        return all(str(g).upper() == 'RESIDENTIAL' for g in self._groups)
+
     async def new_url(
         self,
         session_id: Optional[str] = None,
         request: Optional[Any] = None,  # Request object from crawlee (unused, kept for API compatibility)
         proxy_tier: Optional[int] = None,
+        country_code: Optional[str] = None,
     ) -> str:
         """Get a new proxy URL.
 
@@ -649,18 +664,32 @@ class ProxyConfiguration:
                 configured, the session ID is passed to it.
             request: Request object from crawlee (unused, for API compatibility).
             proxy_tier: Optional tier to select when tiered proxies are used.
+            country_code: Exit country for this URL only (two-letter ISO
+                code). Only for the plain platform proxy without a country of
+                its own (residential); ignored otherwise.
 
         Returns:
             Proxy URL string
         """
         if self._new_url_function:
             return await self._call_new_url_function(session_id)
-        return self._new_url_sync(session_id, proxy_tier)
+        return self._new_url_sync(session_id, proxy_tier, country_code=country_code)
 
-    def _new_url_sync(self, session_id: Optional[str] = None, proxy_tier: Optional[int] = None) -> str:
+    def _new_url_sync(self, session_id: Optional[str] = None, proxy_tier: Optional[int] = None, country_code: Optional[str] = None) -> str:
         """Resolve a proxy URL from the configured proxy_urls / platform gateway."""
         if session_id is not None:
             _validate_session_id(str(session_id))
+
+        if country_code and self._can_pick_country():
+            country_code = country_code.upper()
+            _validate_country_options(country_code, None)
+            key: Tuple[str, int] = (f'{session_id}@{country_code}', -1)
+            if session_id is not None and key in self._session_urls:
+                return self._session_urls[key]
+            url = self._build_platform_url(session_id=session_id, country_code=country_code)
+            if session_id is not None:
+                self._session_urls[key] = url
+            return url
 
         # Session stickiness is scoped per tier (parity with Crawlee's tiered
         # handling): the same session ID on a different tier resolves to that

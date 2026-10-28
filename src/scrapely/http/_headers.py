@@ -107,6 +107,74 @@ def accept_language_for(country_code: Optional[str] = None, locales: Sequence[st
     return f'{lang}-{cc},{lang};q=0.9,en;q=0.8'
 
 
+# ─── per-identity geo: exit country + matching Accept-Language ──────────────
+
+# Exit countries for identities whose proxy has no country set, weighted like
+# desktop web traffic (rough shares by country; only countries the residential
+# pool serves well). The proxy session and Accept-Language use the same draw,
+# so the language always matches the exit IP.
+TRAFFIC_COUNTRIES: Tuple[Tuple[str, float], ...] = (
+    ('US', 32.0), ('GB', 7.0), ('DE', 7.0), ('FR', 5.0), ('CA', 4.0), ('BR', 4.0), ('IN', 3.0),
+    ('IT', 3.5), ('ES', 3.5), ('NL', 2.5), ('PL', 2.5), ('MX', 2.5), ('AU', 2.5), ('JP', 2.0),
+    ('TR', 1.5), ('SE', 1.0), ('BE', 1.0), ('AT', 1.0), ('CH', 1.0), ('PT', 1.0), ('AR', 1.0),
+    ('CO', 1.0), ('RO', 1.0), ('CZ', 1.0), ('ID', 1.0),
+)
+
+# Main country for a bare language (``locales=["de"]``): where its speakers mostly are.
+_LANG_COUNTRY: Dict[str, str] = {
+    'en': 'US', 'de': 'DE', 'fr': 'FR', 'es': 'ES', 'it': 'IT', 'pt': 'BR', 'nl': 'NL', 'pl': 'PL',
+    'cs': 'CZ', 'sk': 'SK', 'hu': 'HU', 'ro': 'RO', 'bg': 'BG', 'el': 'GR', 'tr': 'TR', 'ru': 'RU',
+    'uk': 'UA', 'sv': 'SE', 'nb': 'NO', 'no': 'NO', 'da': 'DK', 'fi': 'FI', 'ja': 'JP', 'ko': 'KR',
+    'zh': 'TW', 'vi': 'VN', 'th': 'TH', 'id': 'ID', 'ms': 'MY', 'he': 'IL', 'ar': 'SA', 'hi': 'IN',
+}
+
+
+def pick_country(rng: Any) -> str:
+    """A country drawn from ``TRAFFIC_COUNTRIES``."""
+    names = [c for c, _ in TRAFFIC_COUNTRIES]
+    return rng.choices(names, weights=[w for _, w in TRAFFIC_COUNTRIES], k=1)[0]
+
+
+def country_for_locale(locale: str) -> Optional[str]:
+    """The country a locale points at: ``de-AT`` → AT, ``de`` → DE, ``en`` → US."""
+    parts = str(locale).strip().replace('_', '-').split('-')
+    for p in parts[1:]:
+        if len(p) == 2 and p.isalpha():
+            return p.upper()
+    return _LANG_COUNTRY.get(parts[0].lower())
+
+
+def accept_language_variants(country_code: Optional[str]) -> List[Tuple[str, float]]:
+    """Accept-Language values real Chrome users in a country send, with rough weights.
+
+    All variants put the country's language first (``de-DE,de;q=0.9`` with or
+    without English after it), so any of them matches an exit IP in that
+    country. Chrome builds the header from the user's language list: the
+    regional tag, its base language, then further languages 0.1 lower each.
+    """
+    cc = (country_code or '').strip().upper()
+    if cc == 'UK':
+        cc = 'GB'
+    if not cc or cc == 'US':
+        return [(DEFAULT_ACCEPT_LANGUAGE, 0.92), ('en-US,en;q=0.9,es;q=0.8', 0.08)]
+    if cc in _ENGLISH_COUNTRIES:
+        return [(f'en-{cc},en;q=0.9', 0.5), (f'en-{cc},en-US;q=0.9,en;q=0.8', 0.2), (DEFAULT_ACCEPT_LANGUAGE, 0.3)]
+    lang = _COUNTRY_LANG.get(cc)
+    if not lang:
+        return [(DEFAULT_ACCEPT_LANGUAGE, 1.0)]
+    return [
+        (f'{lang}-{cc},{lang};q=0.9,en-US;q=0.8,en;q=0.7', 0.45),
+        (f'{lang}-{cc},{lang};q=0.9', 0.30),
+        (f'{lang}-{cc},{lang};q=0.9,en;q=0.8', 0.25),
+    ]
+
+
+def pick_accept_language(country_code: Optional[str], rng: Any) -> str:
+    """One Accept-Language for an identity whose exit is in ``country_code``."""
+    variants = accept_language_variants(country_code)
+    return rng.choices([v for v, _ in variants], weights=[w for _, w in variants], k=1)[0]
+
+
 # ─── sec-fetch-site ─────────────────────────────────────────────────────────
 
 _TWO_LEVEL_SUFFIXES = frozenset(
@@ -257,6 +325,10 @@ def prepare(
     if kind == 'navigate':
         # Backend default headers; we only adjust values that depend on the request.
         prep.default_headers = True
+        for h in profile.header_overrides:
+            # Newer version on the backend's TLS profile: its own UA, client hints and Accept.
+            if h in native:
+                out[h] = native[h]
         if al != native.get('accept-language'):
             out['accept-language'] = al
         site = fetch_site(referer, url)

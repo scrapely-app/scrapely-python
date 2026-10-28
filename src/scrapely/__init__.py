@@ -227,7 +227,7 @@ if TYPE_CHECKING:  # Static analysers and IDEs see the lazy names as plain impor
         set_api_storage,
     )
 
-__version__ = '0.1.38'
+__version__ = '0.1.40'
 __all__ = [
     # Core
     'Actor',

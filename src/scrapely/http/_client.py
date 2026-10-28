@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from ._detect import detect_block, parse_retry_after
-from ._headers import accept_language_for, encode_body, prepare
+from ._headers import accept_language_for, country_for_locale, encode_body, pick_accept_language, pick_country, prepare
 from ._options import FingerprintOptions
 from ._policy import BackoffPolicy, HostState, Identity, RetryPolicy, country_from_proxy, decide, new_session_id
 from ._profiles import BrowserProfile, impersonate_to_options, load_table, pick, select_candidates
@@ -56,6 +56,29 @@ def _with_params(url: str, params: Any) -> str:
     parts = urlsplit(url)
     joined = f'{parts.query}&{query}' if parts.query else query
     return urlunsplit((parts.scheme, parts.netloc, parts.path, joined, parts.fragment))
+
+
+def _normalize_url(url: str) -> str:
+    """``https://host?q`` → ``https://host/?q``: an empty path is sent as ``/``, as browsers do.
+
+    wreq 0.13 sends ``:path: ?q`` over HTTP/2 for such URLs, and servers
+    (Cloudflare, nginx) answer 400 Bad Request.
+    """
+    parts = urlsplit(url)
+    if parts.scheme.lower() in ('http', 'https') and parts.netloc and not parts.path:
+        return urlunsplit((parts.scheme, parts.netloc, '/', parts.query, parts.fragment))
+    return url
+
+
+def _can_pick_country(proxy_configuration: Any) -> bool:
+    """True for a platform proxy that lets each identity choose its exit country."""
+    check = getattr(proxy_configuration, '_can_pick_country', None)
+    if not callable(check):
+        return False
+    try:
+        return bool(check())
+    except Exception:  # noqa: BLE001 - a foreign proxy configuration: keep its own behaviour
+        return False
 
 
 def _rotations(max_rotations: Optional[int], max_retries: Optional[int], default: Optional[int]) -> Optional[int]:
@@ -198,7 +221,12 @@ class _Base:
         # Only a proxy configuration gives each identity its own exit IP.
         self.rotates_ip = proxy_configuration is not None
         country = country_from_proxy(proxy_configuration if proxy_configuration is not None else self.fixed_proxy)
+        self.proxy_country = country
+        # Default Accept-Language of this client (identities draw their own, see _identity_geo).
         self.accept_language = accept_language_for(country, self.options.locales)
+        # A platform proxy without a country: every identity picks its exit
+        # country and sends the matching Accept-Language.
+        self.picks_country = country is None and proxy_configuration is not None and _can_pick_country(proxy_configuration)
         if backoff is None and polite:
             backoff = BackoffPolicy()
         self.policy = RetryPolicy(max_rotations=_rotations(max_rotations, max_retries, 6), backoff=backoff)
@@ -244,14 +272,44 @@ class _Base:
     def _pick_profile(self, avoid: Optional[BrowserProfile]) -> BrowserProfile:
         return pick(self.candidates, self.rng, avoid)
 
-    def _new_identity(self, client: Any, profile: BrowserProfile, session_id: str, proxy_url: Optional[str]) -> Identity:
+    def _identity_geo(self) -> Tuple[Optional[str], str]:
+        """(exit country to request from the proxy or None, Accept-Language) for a new identity.
+
+        - ``locales``: one of them per identity, as a browser has one language
+          setup; with a country-pickable proxy the exit is that locale's country.
+        - proxy with a country: a language setup common in that country.
+        - platform proxy without a country: a country weighted like real
+          traffic, used for both the proxy session and the language.
+        - otherwise (no proxy, own proxy URLs, datacenter): the client default.
+        """
+        locales = self.options.locales
+        if locales:
+            loc = locales[0] if len(locales) == 1 else self.rng.choice(locales)
+            return (country_for_locale(loc) if self.picks_country else None), accept_language_for(None, [loc])
+        if self.proxy_country:
+            return None, pick_accept_language(self.proxy_country, self.rng)
+        if self.picks_country:
+            cc = pick_country(self.rng)
+            return cc, pick_accept_language(cc, self.rng)
+        return None, self.accept_language
+
+    def _new_identity(
+        self,
+        client: Any,
+        profile: BrowserProfile,
+        session_id: str,
+        proxy_url: Optional[str],
+        accept_language: Optional[str] = None,
+        country: Optional[str] = None,
+    ) -> Identity:
         ident = Identity(
             session_id=session_id,
             profile=profile,
             proxy_url=proxy_url,
             client=client,
-            accept_language=self.accept_language,
+            accept_language=accept_language or self.accept_language,
             created_at=self._clock(),
+            country=country or self.proxy_country,
         )
         for name, value, domain, path in self._caller_cookies._cookies:
             self._apply_cookie(ident, name, value, domain, path)
@@ -428,18 +486,22 @@ class AsyncClient(_Base):
             self._cond = asyncio.Condition()
         return self._cond
 
-    async def _proxy_url(self, session_id: str) -> Optional[str]:
+    async def _proxy_url(self, session_id: str, country: Optional[str] = None) -> Optional[str]:
         if self.proxy_configuration is not None:
-            url = await self.proxy_configuration.new_url(session_id=session_id)
+            if country:
+                url = await self.proxy_configuration.new_url(session_id=session_id, country_code=country)
+            else:
+                url = await self.proxy_configuration.new_url(session_id=session_id)
             return str(url) if url else None
         return self.fixed_proxy
 
     async def _open(self, avoid: Optional[BrowserProfile]) -> Identity:
         profile = self._pick_profile(avoid)
         sid = new_session_id(self.rng)
-        proxy_url = await self._proxy_url(sid)
+        country, al = self._identity_geo()
+        proxy_url = await self._proxy_url(sid, country)
         client = self.transport.new_client(profile, proxy_url, self.timeout, self.verify, self.http1_only)
-        return self._new_identity(client, profile, sid, proxy_url)
+        return self._new_identity(client, profile, sid, proxy_url, al, country)
 
     async def _retire(self, ident: Identity, force: bool = False) -> None:
         """Retire an identity; its client closes once no request uses it any more."""
@@ -536,7 +598,7 @@ class AsyncClient(_Base):
     ) -> Response:
         """Send a request; a block or error rotates to a fresh identity at once. Returns the last response."""
         method = method.upper()
-        url = _with_params(url, params)
+        url = _normalize_url(_with_params(url, params))
         body, ctype = encode_body(data, json, content)
         host, hs = self._host(url)
         started = self._clock()
@@ -684,6 +746,16 @@ class AsyncHttpSession:
     def session_id(self) -> Optional[str]:
         return self._pin.identity.session_id if self._pin.identity else None
 
+    @property
+    def accept_language(self) -> Optional[str]:
+        """Accept-Language of the current identity."""
+        return self._pin.identity.accept_language if self._pin.identity else None
+
+    @property
+    def country(self) -> Optional[str]:
+        """Exit country the current identity asked the proxy for (None when the proxy chooses)."""
+        return self._pin.identity.country if self._pin.identity else None
+
     async def request(self, method: str, url: str, **kwargs: Any) -> Response:
         return await self._client.request(method, url, _pin=self._pin, **kwargs)
 
@@ -755,18 +827,18 @@ class Client(_Base):
     def _make_transport(self, backend: str) -> Any:
         return WreqSyncTransport() if backend == 'wreq' else CurlSyncTransport(self.table.curl_cffi_targets)
 
-    def _proxy_url(self, session_id: str) -> Optional[str]:
+    def _proxy_url(self, session_id: str, country: Optional[str] = None) -> Optional[str]:
         pc = self.proxy_configuration
         if pc is None:
             return self.fixed_proxy
         sync = getattr(pc, '_new_url_sync', None)
         if sync is not None and not getattr(pc, '_new_url_function', None):
-            url = sync(session_id)
+            url = sync(session_id, country_code=country) if country else sync(session_id)
         else:
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                url = asyncio.run(pc.new_url(session_id=session_id))
+                url = asyncio.run(pc.new_url(session_id=session_id, country_code=country) if country else pc.new_url(session_id=session_id))
             else:
                 raise RuntimeError('scrapely.http.Client: use AsyncClient inside async code (this proxy configuration needs await)')
         return str(url) if url else None
@@ -775,10 +847,11 @@ class Client(_Base):
         profile = self._pick_profile(avoid)
         with self._lock:
             sid = new_session_id(self.rng)
-        proxy_url = self._proxy_url(sid)
+            country, al = self._identity_geo()
+        proxy_url = self._proxy_url(sid, country)
         client = self.transport.new_client(profile, proxy_url, self.timeout, self.verify, self.http1_only)
         with self._lock:
-            return self._new_identity(client, profile, sid, proxy_url)
+            return self._new_identity(client, profile, sid, proxy_url, al, country)
 
     def _retire(self, ident: Identity, force: bool = False) -> None:
         """Retire an identity; its client closes once no request uses it any more."""
@@ -885,7 +958,7 @@ class Client(_Base):
     ) -> Response:
         """Send a request; a block or error rotates to a fresh identity at once. Returns the last response."""
         method = method.upper()
-        url = _with_params(url, params)
+        url = _normalize_url(_with_params(url, params))
         body, ctype = encode_body(data, json, content)
         with self._lock:
             host, hs = self._host(url)
@@ -1029,6 +1102,16 @@ class HttpSession:
     @property
     def session_id(self) -> Optional[str]:
         return self._pin.identity.session_id if self._pin.identity else None
+
+    @property
+    def accept_language(self) -> Optional[str]:
+        """Accept-Language of the current identity."""
+        return self._pin.identity.accept_language if self._pin.identity else None
+
+    @property
+    def country(self) -> Optional[str]:
+        """Exit country the current identity asked the proxy for (None when the proxy chooses)."""
+        return self._pin.identity.country if self._pin.identity else None
 
     def request(self, method: str, url: str, **kwargs: Any) -> Response:
         return self._client.request(method, url, _pin=self._pin, **kwargs)

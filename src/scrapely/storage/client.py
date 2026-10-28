@@ -334,23 +334,29 @@ class ApiStorageClient:
 
         path = kvs_record_path(store_id, key)
         headers = {'Content-Type': content_type}
+        # One key for every attempt of this write: a re-send after a lost answer
+        # (edge 502/504, dropped connection) is applied and counted once.
+        idempotency_key = uuid.uuid4().hex
         if isinstance(value, bytes):
             await self.api_client.put(
                 path,
                 content=value,
                 headers=headers,
+                idempotency_key=idempotency_key,
             )
         elif isinstance(value, str) and content_type != 'application/json':
             await self.api_client.put(
                 path,
                 content=value.encode('utf-8'),
                 headers=headers,
+                idempotency_key=idempotency_key,
             )
         else:
             await self.api_client.put(
                 path,
                 json_data=value,
                 headers=headers,
+                idempotency_key=idempotency_key,
             )
 
     async def kvs_delete_record(self, store_id: str, key: str) -> None:

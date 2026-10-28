@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.40] - 2026-10-28
+
+0.1.39 was never published to PyPI. This release includes the 0.1.39 change below, plus these fixes to `scrapely.http` from the fingerprint test on staging (2026-10-27):
+
+- **Accept-Language matches the exit IP.** Before, a client without a proxy country sent `en-US` on every identity: 8 of 20 residential sessions did so from Brazil, France, Spain, Mexico or Taiwan.
+  - **Residential platform proxy without a country:** each identity now picks an exit country, weighted like real web traffic, asks the proxy for it and sends that country's language.
+  - **Proxy with a country:** each identity gets one of the language setups common there (for example `de-DE,de;q=0.9` or `de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7`).
+  - **Several `locales`:** each identity uses one of them, not all of them in one header. With a residential proxy without a country, the exit follows the locale's country.
+  - **Unchanged:** no proxy, your own proxy URLs and the `DATACENTER` group (US exits only) keep `en-US,en;q=0.9`.
+  - `ProxyConfiguration.new_url()` takes an optional `country_code` for one URL (residential platform proxy without a country only). Sessions expose `accept_language` and `country`.
+- **No more `400` on `https://host?q`.** A URL with a query and no path is sent with the path `/`. wreq 0.13 sent `:path: ?q` over HTTP/2, which Cloudflare and nginx reject.
+- **Chrome 155 and 156.** The default profiles are Chrome 156, 155, 154 and 153, weighted 55 / 30 / 10 / 5. 155 and 156 use the Chrome 154 TLS and HTTP/2 profile, which is the same as real Chrome 156's, with their own User-Agent, `sec-ch-ua` and Accept (with `image/jxl`, which real 155 and 156 send).
+- **Firefox 153 ESR.** Added Firefox 153 (ESR) next to 152. Both match real Firefox 153.6 ESR and 152 builds byte for byte in the TLS ClientHello and HTTP/2 settings, and are now marked verified.
+
+## [0.1.39] - 2026-10-27 (not published)
+
+- A key-value store record write (`Actor.set_value`, `KeyValueStore.set_value`) is no longer lost to one failed answer. Each write now sends an `Idempotency-Key`, and when its answer is lost (a `502`/`504` page from the edge or load balancer, a dropped connection, a timeout) it is sent again with the same key; the API applies and counts it once. Before, the write was never re-sent, so one such page on the final `OUTPUT` write failed the whole run. An API that answers a keyed write without `X-Scrapely-Idempotency` (an older server) gets no re-sends, as before.
+
 ## [0.1.38] - 2026-10-27
 
 0.1.37 was never published to PyPI. This release includes everything listed under 0.1.37 below, plus these changes to `scrapely.http`:
