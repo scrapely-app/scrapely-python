@@ -726,7 +726,22 @@ class Actor(metaclass=_ActorMeta):
         await cls._exit_with(opts)
 
     @classmethod
+    def _truthful_status_message(cls, message: Optional[str]) -> Optional[str]:
+        """Name the limit that really stopped the run in a status message.
+
+        Actors word a refused charge as "the maximum charge for this run was
+        reached" whatever refused it. Once the run hit a limit, the charging
+        manager knows which one (the item limit, the maximum charge, the
+        balance), and that clause is replaced by its stop message.
+        """
+        rewrite = getattr(cls._charging_manager, 'rewrite_status_message', None)
+        if not message or rewrite is None:
+            return message
+        return rewrite(message)
+
+    @classmethod
     async def _exit_with(cls, opts: ExitOptions, persist_message: bool = True) -> None:
+        opts.status_message = cls._truthful_status_message(opts.status_message)
         if opts.status_message and persist_message:
             logger.info(f'[Scrapely] {opts.status_message}')
 
@@ -1289,6 +1304,7 @@ class Actor(metaclass=_ActorMeta):
             The updated ActorRun object, or an empty ActorRun when running locally.
         """
         cls._ensure_initialized('set_status_message')
+        message = cls._truthful_status_message(message) or message
         opts = options or SetStatusMessageOptions()
         level = (getattr(opts, 'level', None) or 'INFO').upper()
         if is_terminal is None:
@@ -1371,6 +1387,7 @@ class Actor(metaclass=_ActorMeta):
         if not api_url or not token or not run_id:
             return None
 
+        message = cls._truthful_status_message(message) or message
         client = cls.new_client(token=token, base_url=api_url)
         # Setting the message is idempotent: a 429 (run API rate limit), 5xx or
         # dropped connection is retried with backoff instead of failing the run.

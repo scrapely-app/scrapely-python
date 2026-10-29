@@ -13,6 +13,7 @@ import contextvars
 import json
 import os
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -73,6 +74,87 @@ def _is_transient_status(status: Optional[int]) -> bool:
 # Local-only dataset collecting one entry per logical charge operation
 # (JS ChargingManager LOCAL_CHARGING_LOG_DATASET_NAME parity).
 LOCAL_CHARGING_LOG_DATASET_NAME = 'charging_log'
+
+
+# Which run limit refused or cut down a charge (the platform's ``error.reason``
+# on HTTP 402 and ``limitedBy`` on a partial acceptance). The run's stop
+# message names it, so an item limit is never called a spending limit.
+CHARGE_LIMIT_MAX_ITEMS = 'max-items'
+CHARGE_LIMIT_MAX_CHARGE = 'max-charge'
+CHARGE_LIMIT_INSUFFICIENT_FUNDS = 'insufficient-funds'
+_CHARGE_LIMIT_REASONS = frozenset({CHARGE_LIMIT_MAX_ITEMS, CHARGE_LIMIT_MAX_CHARGE, CHARGE_LIMIT_INSUFFICIENT_FUNDS})
+
+
+def _format_usd(value: Any) -> str:
+    """$3.00, $0.005: two decimals unless the amount needs more."""
+    try:
+        amount = Decimal(str(value))
+    except Exception:
+        return f'${value}'
+    if amount == amount.quantize(Decimal('0.01')):
+        return f'${amount:.2f}'
+    return f"${format(amount.normalize(), 'f')}"
+
+
+def charge_limit_stop_message(
+    reason: Optional[str], *, max_items: Optional[int] = None, max_total_charge_usd: Any = None
+) -> Optional[str]:
+    """The run's stop message for a charge limit, or None when the reason is unknown."""
+    if reason == CHARGE_LIMIT_MAX_ITEMS:
+        if max_items is not None and max_items > 0:
+            unit = 'item' if max_items == 1 else 'items'
+            return f'Stopped: reached the item limit you set ({max_items} {unit})'
+        return 'Stopped: reached the item limit you set'
+    if reason == CHARGE_LIMIT_MAX_CHARGE:
+        if max_total_charge_usd is not None:
+            return f'Stopped: reached the maximum charge you set ({_format_usd(max_total_charge_usd)})'
+        return 'Stopped: reached the maximum charge you set'
+    if reason == CHARGE_LIMIT_INSUFFICIENT_FUNDS:
+        return 'Stopped: your account has no credit left for this run'
+    return None
+
+
+# A status-message clause that blames the spending limit ("stopped because the
+# maximum charge for this run was reached", "The run reached its maximum total
+# charge. Stopping.", ...). Actors written before the platform said which limit
+# was hit use such texts for every refused charge.
+_CHARGE_CLAIM_RE = re.compile(r'\bmax(?:imum)?\s+(?:total\s+)?charge|\bspending\s+limit', re.IGNORECASE)
+_CLAUSE_SEPARATOR_RE = re.compile(r'(;\s*|[.!?](?:\s+|$))')
+
+
+def rewrite_charge_limit_claims(message: str, stop_message: Optional[str]) -> str:
+    """Replace the clause of ``message`` that blames the spending limit with ``stop_message``.
+
+    "Saved 800 results; stopped because the maximum charge for this run was
+    reached" becomes "Saved 800 results. Stopped: reached the item limit you set
+    (800 items)". Only the first such clause is replaced (later ones are
+    dropped); a message without one is returned as is.
+    """
+    if not message or not stop_message or stop_message in message or not _CHARGE_CLAIM_RE.search(message):
+        return message
+    parts = _CLAUSE_SEPARATOR_RE.split(message)
+    out: List[str] = []
+    replaced = False
+    for i in range(0, len(parts), 2):
+        clause = parts[i]
+        sep = parts[i + 1] if i + 1 < len(parts) else ''
+        if not _CHARGE_CLAIM_RE.search(clause):
+            out.append(clause + sep)
+            continue
+        if replaced:
+            continue
+        replaced = True
+        if out and out[-1].rstrip().endswith(';'):
+            out[-1] = out[-1].rstrip()[:-1].rstrip() + '. '
+        lead = clause[: len(clause) - len(clause.lstrip())]
+        tail = ''
+        if sep:
+            tail = '.' + sep[len(sep.rstrip()):] if sep.strip() in (';', '.', '!', '?') else sep
+        out.append(lead + stop_message + tail)
+    result = ''.join(out).rstrip()
+    if message.rstrip().endswith('.') and not result.endswith('.'):
+        result += '.'
+    return result
 
 
 # Charge-limit safety net for the default dataset.
@@ -205,6 +287,8 @@ class ChargeRejectedError(Exception):
         count: int,
         status_code: Optional[int] = None,
         reason: str = 'rejected',
+        limit_reason: Optional[str] = None,
+        max_items: Optional[int] = None,
     ) -> None:
         super().__init__(message)
         self.operation_id = operation_id
@@ -212,6 +296,9 @@ class ChargeRejectedError(Exception):
         self.count = count
         self.status_code = status_code
         self.reason = reason
+        # Which run limit refused the charge (CHARGE_LIMIT_*), when the platform said.
+        self.limit_reason = limit_reason
+        self.max_items = max_items
 
 
 class ChargingManager:
@@ -282,6 +369,13 @@ class ChargingManager:
         # Sticky: the platform refused or capped a charge (HTTP 402 / fewer
         # events accepted) or the local budget gate trimmed one.
         self._charge_limit_hit = False
+        # Which limit that was (CHARGE_LIMIT_*; the first one known wins) and the
+        # run's item limit as the platform reported it.
+        self._charge_limit_reason: Optional[str] = None
+        self._charge_limit_max_items: Optional[int] = None
+        # limitedBy / maxItems of the last partially accepted charge response.
+        self._last_limited_by: Optional[str] = None
+        self._last_limit_max_items: Optional[int] = None
         # Default-dataset rows refused after the limit (one warning, then a count).
         self._refused_default_dataset_items = 0
         # Prepaid-row balance: priced events charged through charge() minus rows
@@ -301,9 +395,9 @@ class ChargingManager:
         self._closed = True
         if self._refused_default_dataset_items:
             logger.warning(
-                '%s result(s) pushed to the default dataset after the spending limit was '
-                'reached were not saved',
+                '%s result(s) pushed to the default dataset after %s was reached were not saved',
                 self._refused_default_dataset_items,
+                self._limit_name(),
             )
 
     def _remaining_budget_usd(self) -> Decimal:
@@ -350,24 +444,107 @@ class ChargingManager:
             return False
         return self._remaining_budget_usd() < min(prices)
 
-    def _mark_charge_limit_hit(self) -> None:
+    def _mark_charge_limit_hit(self, reason: Optional[str] = None, max_items: Optional[int] = None) -> None:
         if self._pricing_info is not None:
             self._charge_limit_hit = True
+            if reason in _CHARGE_LIMIT_REASONS and self._charge_limit_reason is None:
+                self._charge_limit_reason = reason
+            if reason == CHARGE_LIMIT_MAX_ITEMS and max_items is not None and max_items > 0:
+                self._charge_limit_max_items = max_items
+
+    def _mark_rejected_charge(self, err: 'ChargeRejectedError') -> None:
+        """Record a definitive platform refusal that means the run's limit is used up."""
+        if _is_charge_limit_rejection(err):
+            self._mark_charge_limit_hit(err.limit_reason, err.max_items)
+
+    def _mark_partial_charge(self) -> None:
+        """The platform accepted fewer events than asked: record which limit cut it."""
+        self._mark_charge_limit_hit(self._last_limited_by, self._last_limit_max_items)
+
+    def _max_items_setting(self) -> Optional[int]:
+        """The run's item limit: as the platform reported it, else ACTOR_MAX_PAID_DATASET_ITEMS."""
+        if self._charge_limit_max_items is not None:
+            return self._charge_limit_max_items
+        try:
+            raw = self._config.get('actor_max_paid_dataset_items')
+            value = int(raw) if raw not in (None, '') else None
+        except (TypeError, ValueError):
+            value = None
+        return value if value is not None and value > 0 else None
+
+    def get_charge_limit_reason(self) -> Optional[str]:
+        """Why this run's charges stopped being accepted, or None while they still are.
+
+        One of ``'max-items'`` (the item limit the user set, maxItems),
+        ``'max-charge'`` (the maximum total charge, maxTotalChargeUsd) or
+        ``'insufficient-funds'`` (the account balance). Platforms that do not
+        say which limit it was: inferred from the run's settings.
+        """
+        if not self.is_charge_limit_reached():
+            return None
+        if self._charge_limit_reason is not None:
+            return self._charge_limit_reason
+        max_items = self._max_items_setting()
+        if max_items is not None and any(
+            count >= max_items
+            for name, count in self._charged_events.items()
+            if not is_default_dataset_item_event(name) and self._per_event_prices.get(name, 0) > 0
+        ):
+            return CHARGE_LIMIT_MAX_ITEMS
+        if self._max_total_charge_usd is not None:
+            prices = [price for price in self._per_event_prices.values() if price > 0]
+            if prices and self._remaining_budget_usd() < min(prices):
+                return CHARGE_LIMIT_MAX_CHARGE
+        return None
+
+    def get_charge_limit_message(self) -> Optional[str]:
+        """The run's stop message for the limit that was reached, or None.
+
+        "Stopped: reached the item limit you set (800 items)", "Stopped: reached
+        the maximum charge you set ($3.00)", ... Use it as (part of) the final
+        status message when the Actor stops because a charge was refused.
+        """
+        return charge_limit_stop_message(
+            self.get_charge_limit_reason(),
+            max_items=self._max_items_setting(),
+            max_total_charge_usd=self._max_total_charge_usd,
+        )
+
+    def rewrite_status_message(self, message: str) -> str:
+        """``message`` with a clause blaming the spending limit replaced by the real reason.
+
+        Only once a limit was reached; any other message is returned as is.
+        """
+        try:
+            return rewrite_charge_limit_claims(message, self.get_charge_limit_message())
+        except Exception:  # noqa: BLE001 - a status message must never break the run
+            return message
+
+    def _limit_name(self) -> str:
+        """'the item limit of this run (maxItems = 800)', ... for log lines."""
+        reason = self.get_charge_limit_reason()
+        if reason == CHARGE_LIMIT_MAX_ITEMS:
+            max_items = self._max_items_setting()
+            return f'the item limit of this run (maxItems = {max_items})' if max_items else 'the item limit of this run (maxItems)'
+        if reason == CHARGE_LIMIT_INSUFFICIENT_FUNDS:
+            return 'the end of the account balance'
+        if reason == CHARGE_LIMIT_MAX_CHARGE or self._max_total_charge_usd is not None:
+            limit = f'${self._max_total_charge_usd}' if self._max_total_charge_usd is not None else 'the limit'
+            return f'the spending limit of this run (maxTotalChargeUsd = {limit})'
+        return 'the limit of this run'
 
     def _note_refused_default_dataset_items(self, count: int) -> None:
         """Count rows dropped because of the limit; warn on the first one only."""
         if count <= 0:
             return
         if not self._refused_default_dataset_items:
-            limit = (
-                f'${self._max_total_charge_usd}' if self._max_total_charge_usd is not None else 'the limit'
-            )
+            name = self._limit_name()
             logger.warning(
-                'The spending limit of this run (maxTotalChargeUsd = %s) has been reached: '
+                '%s has been reached: '
                 'results pushed to the default dataset are no longer saved. The Actor should '
                 'stop now (check ChargeResult.event_charge_limit_reached or '
                 'Actor.get_charging_manager().is_charge_limit_reached()).',
-                limit,
+                name[0].upper() + name[1:],
             )
         self._refused_default_dataset_items += count
 
@@ -927,6 +1104,7 @@ class ChargingManager:
                     deadline=deadline,
                 )
                 self._last_remaining_budget_nd = _read_remaining_budget_nd(body)
+                self._last_limited_by, self._last_limit_max_items = _read_limited_by(body)
                 return _read_accepted_count(body, count)
             except Exception as e:
                 last_error = e
@@ -997,8 +1175,7 @@ class ChargingManager:
                             deadline=deadline,
                         )
                     except ChargeRejectedError as err:
-                        if _is_charge_limit_rejection(err):
-                            self._mark_charge_limit_hit()
+                        self._mark_rejected_charge(err)
                         self._unwind_reservation(event_name, count)
                         self._drop_pending(idempotency_key)
                         logger.warning(
@@ -1010,7 +1187,7 @@ class ChargingManager:
                         continue
                     if accepted is not None:
                         if accepted < count:
-                            self._mark_charge_limit_hit()
+                            self._mark_partial_charge()
                             self._unwind_reservation(event_name, count - accepted)
                         self._drop_pending(idempotency_key)
                         confirmed += 1
@@ -1100,7 +1277,8 @@ class ChargingManager:
                     )
 
             if chargeable_count < count:
-                self._mark_charge_limit_hit()
+                # The local budget gate: only maxTotalChargeUsd trims here.
+                self._mark_charge_limit_hit(CHARGE_LIMIT_MAX_CHARGE)
 
             if chargeable_count <= 0:
                 return ChargeResult(
@@ -1155,8 +1333,7 @@ class ChargingManager:
                     idempotency_key=idempotency_key,
                 )
             except ChargeRejectedError as rejected:
-                if _is_charge_limit_rejection(rejected):
-                    self._mark_charge_limit_hit()
+                self._mark_rejected_charge(rejected)
                 # Server definitively rejected: unwind local reservation.
                 self._drop_pending(idempotency_key)
                 self._unwind_reservation(event_name, chargeable_count)
@@ -1171,7 +1348,7 @@ class ChargingManager:
                     self._last_accepted_operation_id = idempotency_key
                 if accepted < chargeable_count:
                     # The platform capped the charge at the run's limit.
-                    self._mark_charge_limit_hit()
+                    self._mark_partial_charge()
                     self._unwind_reservation(event_name, chargeable_count - accepted)
                     chargeable_count = accepted
                     result = ChargeResult(
@@ -1223,11 +1400,12 @@ class ChargingManager:
         if chargeable_count < count:
             subject = 'instance' if count == 1 else 'instances'
             logger.info(
-                "Charging %s %s of '%s' event would exceed maxTotalChargeUsd - "
+                "Charging %s %s of '%s' event would exceed %s - "
                 'only %s events were charged',
                 count,
                 subject,
                 event_name,
+                self._limit_name(),
                 chargeable_count,
             )
 
@@ -1421,6 +1599,43 @@ def _read_remaining_budget_nd(body: Any) -> Optional[int]:
     return None
 
 
+def _positive_int(raw: Any) -> Optional[int]:
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return int(raw)
+    return None
+
+
+def _read_limited_by(body: Any) -> tuple[Optional[str], Optional[int]]:
+    """limitedBy and maxItems of a partially accepted charge (platforms that send them)."""
+    if not isinstance(body, dict):
+        return None, None
+    data = body.get('data') if isinstance(body.get('data'), dict) else body
+    if not isinstance(data, dict):
+        return None, None
+    reason = data.get('limitedBy')
+    return (reason if reason in _CHARGE_LIMIT_REASONS else None), _positive_int(data.get('maxItems'))
+
+
+def _rejection_limit(body: Any, message: str) -> tuple[Optional[str], Optional[int]]:
+    """Which limit a 402 names: error.reason, else its message (older platforms)."""
+    reason: Optional[str] = None
+    max_items: Optional[int] = None
+    if isinstance(body, dict):
+        error = body.get('error')
+        if isinstance(error, dict) and error.get('reason') in _CHARGE_LIMIT_REASONS:
+            reason = error['reason']
+        max_items = _positive_int(body.get('maxItems'))
+    if reason is None:
+        text = message.lower()
+        if 'maxitems' in text or 'maximum number of results' in text:
+            reason = CHARGE_LIMIT_MAX_ITEMS
+        elif 'insufficient balance' in text:
+            reason = CHARGE_LIMIT_INSUFFICIENT_FUNDS
+        elif 'maximum total charge' in text:
+            reason = CHARGE_LIMIT_MAX_CHARGE
+    return reason, max_items
+
+
 def _read_accepted_count(body: Any, fallback: int) -> int:
     if not isinstance(body, dict):
         return fallback
@@ -1446,6 +1661,9 @@ def _classify_charge_http_error(
 
     # 401/403: ownership or scoped-run authorization failures are permanent.
     if status in (400, 401, 402, 403, 404, 405, 409):
+        limit_reason, max_items = (
+            _rejection_limit(getattr(err, 'body', None), str(err)) if status == 402 else (None, None)
+        )
         return ChargeRejectedError(
             f'Charge rejected by platform (HTTP {status}) for event {event_name!r}',
             operation_id=operation_id,
@@ -1453,6 +1671,8 @@ def _classify_charge_http_error(
             count=count,
             status_code=int(status) if status is not None else None,
             reason='charge-limit-exceeded' if status == 402 else f'http-{status}',
+            limit_reason=limit_reason,
+            max_items=max_items,
         )
 
     # A 5xx / 408 / 429 answer is never a definitive rejection, whatever its text
@@ -1472,6 +1692,11 @@ def _classify_charge_http_error(
             'conflict',
         )
     ):
+        limit_reason, max_items = (
+            _rejection_limit(getattr(err, 'body', None), message)
+            if 'charge-limit-exceeded' in message.lower()
+            else (None, None)
+        )
         return ChargeRejectedError(
             message,
             operation_id=operation_id,
@@ -1479,6 +1704,8 @@ def _classify_charge_http_error(
             count=count,
             status_code=int(status) if isinstance(status, int) else None,
             reason='message-match',
+            limit_reason=limit_reason,
+            max_items=max_items,
         )
     return None
 
@@ -1580,7 +1807,7 @@ async def push_data_and_charge(
         limited_items = items[:limited_count] if limited_count < len(items) else items
         if is_ppe and is_default_dataset and limited_count < len(items):
             # Rows beyond what the budget can pay for are dropped.
-            charging_manager._mark_charge_limit_hit()
+            charging_manager._mark_charge_limit_hit(CHARGE_LIMIT_MAX_CHARGE)
             charging_manager._note_refused_default_dataset_items(len(items) - limited_count)
 
         if not limited_items:

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.41] - 2026-10-29
+
+- **A refused charge names the limit that refused it.** When a charge is refused or cut short, the platform now says why (HTTP 402 `error.reason`, and `limitedBy` on a partial acceptance): the run's item limit (`maxItems`), its maximum total charge (`maxTotalChargeUsd`) or the account balance. The SDK used to call all of them the spending limit; a run stopped by its item limit logged "The spending limit of this run (maxTotalChargeUsd = $3.0) has been reached". Now:
+  - The SDK's own log lines name the real limit ("The item limit of this run (maxItems = 800) has been reached: ...").
+  - `ChargingManager.get_charge_limit_reason()` returns `'max-items'`, `'max-charge'` or `'insufficient-funds'` (None while charges are still accepted), and `get_charge_limit_message()` the stop message: "Stopped: reached the item limit you set (800 items)", "Stopped: reached the maximum charge you set ($3.00)" or "Stopped: your account has no credit left for this run".
+  - Once a limit was reached, a status message (`Actor.set_status_message`, `Actor.exit`, `Actor.fail`) whose clause blames the maximum charge ("Saved 800 results; stopped because the maximum charge for this run was reached") gets that clause replaced by the real stop message ("Saved 800 results. Stopped: reached the item limit you set (800 items)"). Other messages are untouched.
+  - Platforms that do not send the reason yet: inferred from the 402 message and `ACTOR_MAX_PAID_DATASET_ITEMS`.
+  - What is charged and saved does not change.
+
 ## [0.1.40] - 2026-10-28
 
 0.1.39 was never published to PyPI. This release includes the 0.1.39 change below, plus these fixes to `scrapely.http` from the fingerprint test on staging (2026-10-27):
