@@ -62,6 +62,7 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 
 __all__ = [
+    "AkamaiSensor",
     "Clearance",
     "DEGRADED_STATUS_MESSAGE",
     "IpBanned",
@@ -72,11 +73,16 @@ __all__ = [
     "SolverAuthError",
     "SolverRateLimited",
     "SolverRequestInvalid",
+    "SensorResult",
     "SolverUnavailable",
     "VendorUnavailable",
+    "abck_state",
     "check_solver_response",
     "degraded_status_message",
     "detect_vendor",
+    "find_pixel_collector",
+    "find_sbsd_bundle",
+    "find_sensor_script",
     "is_blocked",
     "solver_env",
     "solver_status",
@@ -874,3 +880,361 @@ class Solver:
         if not ok:
             raise SolveAttemptError("still blocked after the clearance was applied")
         return clearance
+
+
+# ─── Akamai Bot Manager on your own session (sensor WebSocket lane + SBSD) ──
+
+
+_SCRIPT_SRC_RE = re.compile(r"<script[^>]+src=[\"']([^\"']+)[\"']", re.I)
+_SBSD_NONCE_RE = re.compile(r"(?:^|&)v=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:&|$)", re.I)
+_PIXEL_PATH_RE = re.compile(r"^/akam/\d+/")
+_LONG_PATH_RE = re.compile(r"<script[^>]+src=[\"']((?:/[a-zA-Z0-9\-_]+){5,10}(?:\?v=[^\"']*)?)[\"']", re.I)
+_AKAM_PIXEL_TAG_RE = re.compile(r"akam/13.*?top:\s?-999px.*?src=\"(.*?)\"", re.S)
+_AKAM_KEYWORD_RE = re.compile(r"<script[^>]+src=[\"']([^\"']*/(?:akam|_abck|bm-)[^\"']+)[\"']", re.I)
+_STRIP_SCRIPTS_RE = re.compile(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", re.I)
+# Headers the submission must carry from YOUR client (its fingerprint), never the solver's copy.
+_OWN_HEADERS = {"user-agent", "cookie", "host", "content-length", "accept-language", "accept-encoding", "connection",
+                "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"}
+
+
+def _urljoin(base: str, ref: str) -> str:
+    from urllib.parse import urljoin
+
+    return urljoin(base, ref)
+
+
+def _is_sbsd_bundle(url: str) -> bool:
+    u = httpx.URL(url)
+    return u.path.startswith("/.well-known/sbsd") or bool(_SBSD_NONCE_RE.search(u.query.decode() if isinstance(u.query, bytes) else str(u.query or "")))
+
+
+def _is_sensor_candidate(url: str) -> bool:
+    return not _is_sbsd_bundle(url) and not _PIXEL_PATH_RE.match(httpx.URL(url).path)
+
+
+def _sbsd_src(html: str, base_url: str) -> tuple[str, str] | None:
+    for m in _SCRIPT_SRC_RE.finditer(html or ""):
+        u = _urljoin(base_url, m.group(1))
+        if _is_sbsd_bundle(u):
+            return m.group(1), u
+    return None
+
+
+def find_sbsd_bundle(html: str, base_url: str) -> str | None:
+    """URL of the SBSD bundle script a page loads (``src`` with a UUID ``v=``, or ``/.well-known/sbsd``), or None."""
+    found = _sbsd_src(html, base_url)
+    return found[1] if found else None
+
+
+def find_sensor_script(html: str, base_url: str) -> str | None:
+    """URL of the Akamai ``_abck`` sensor script in a page, or None (the provider examples' three patterns)."""
+    html = html or ""
+    m = _AKAM_PIXEL_TAG_RE.search(html)
+    if m:
+        u = _urljoin(base_url, m.group(1))
+        if _is_sensor_candidate(u):
+            return u
+    for m in _LONG_PATH_RE.finditer(html):
+        u = _urljoin(base_url, m.group(1))
+        if _is_sensor_candidate(u):
+            return u
+    m = _AKAM_KEYWORD_RE.search(html)
+    if m:
+        u = _urljoin(base_url, m.group(1))
+        if _is_sensor_candidate(u):
+            return u
+    return None
+
+
+_PIXEL_COLLECTOR_RE = re.compile(r"<script[^>]+src=[\"']([^\"']*/akam/\d+/[0-9a-f]{6,})[\"']", re.I)
+
+
+def find_pixel_collector(html: str, base_url: str) -> str | None:
+    """URL of Akamai's pixel collector script (``/akam/<n>/<hex>``, it POSTs to ``/akam/<n>/pixel_<hex>``), or None."""
+    m = _PIXEL_COLLECTOR_RE.search(html or "")
+    return _urljoin(base_url, m.group(1)) if m else None
+
+
+def pixel_target(collector_url: str) -> str:
+    """The endpoint a pixel collector POSTs to: its own directory, ``pixel_`` + its basename, no query."""
+    u = httpx.URL(collector_url)
+    head, _, name = u.path.rpartition("/")
+    return f"{u.scheme}://{u.host}{head}/pixel_{name}"
+
+
+def abck_state(value: str | None) -> str | None:
+    """The state field of an ``_abck`` cookie: ``'0'`` accepted, ``'-1'`` keep going, None when absent."""
+    parts = (value or "").split("~")
+    return parts[1] if len(parts) > 1 else None
+
+
+def _cookie_dict(session: Any) -> dict[str, str]:
+    jar = getattr(session, "cookies", None)
+    if jar is None:
+        return {}
+    try:
+        if hasattr(jar, "jar"):
+            return {c.name: c.value for c in jar.jar}
+        return dict(jar.items())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _ws_connect(url: str, headers: dict[str, str]) -> Any:
+    """websockets.connect with request headers (``additional_headers`` from 13, ``extra_headers`` before)."""
+    import websockets
+
+    try:
+        return websockets.connect(url, additional_headers=headers, max_size=32 * 1024 * 1024, open_timeout=30)
+    except TypeError:
+        return websockets.connect(url, extra_headers=headers, max_size=32 * 1024 * 1024, open_timeout=30)
+
+
+def _refused_upgrade(exc: BaseException) -> tuple[int, str, str | None]:
+    """(status, body, Retry-After) of a refused WebSocket upgrade, across websockets versions."""
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = int(getattr(response, "status_code", 0) or 0)
+        raw = getattr(response, "body", b"") or b""
+        headers = getattr(response, "headers", None)
+        return status, raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw), headers.get("retry-after") if headers is not None else None
+    status = int(getattr(exc, "status_code", 0) or 0)
+    headers = getattr(exc, "headers", None)
+    return status, "", headers.get("retry-after") if headers is not None else None
+
+
+def _is_scrapely_http(session: Any) -> bool:
+    return type(session).__module__.startswith("scrapely.http")
+
+
+async def _session_send(session: Any, method: str, url: str, *, headers: dict, body: str | bytes | None, kind: str, timeout: float) -> tuple[int, str]:
+    kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout}
+    if body is not None:
+        data = body.encode() if isinstance(body, str) else body
+        kwargs["content" if (_is_httpx(session) or _is_scrapely_http(session)) else "data"] = data
+    if _is_scrapely_http(session):
+        # One identity for the whole solve: no rotation, and a 403 is an answer, not a block to route around.
+        kwargs.update(kind=kind, max_rotations=0, is_blocked=lambda r: None)
+    r = await session.request(method, url, **kwargs)
+    return _status_body(r)
+
+
+@dataclass
+class SensorResult:
+    """Outcome of ``AkamaiSensor.solve_abck``: whether the provider reported ``_abck`` accepted."""
+
+    accepted: bool
+    rounds: int = 0
+    submissions: int = 0
+    abck: str | None = None
+    error: str | None = None
+
+
+class AkamaiSensor:
+    """Akamai Bot Manager solved on YOUR HTTP session, the way the provider's own examples do it.
+
+    Two independent channels, both answered through the session you pass, so
+    every request carries your client's fingerprint, exit IP and cookie jar:
+
+    * ``solve_sbsd(session, url, html)``: the page loads an SBSD bundle (a
+      script whose ``src`` has a UUID ``v=``, often a ~440-byte "Access Denied"
+      bootstrap). The bundle is fetched on your session, the provider computes
+      the ledger (``/akamai/sbsd/generate-session``), and its rows are POSTed to
+      the bundle path on your session.
+    * ``solve_abck(session, url, html)``: the classic ``_abck`` sensor over the
+      provider's stateful WebSocket (``/akamai/session``, relayed by the
+      platform for runs). The provider generates each sensor; it is POSTed on
+      your session; rounds continue until ``_abck`` is ``~0~``.
+
+    ``solve(session, url, html)`` does SBSD when the page carries a bundle, then ``_abck``.
+
+    Use a session that keeps its identity on a block (``http.session(keep_identity=True)``
+    of ``scrapely.http``, or one curl_cffi / httpx client): the solve, the
+    retries and the page fetches must share one identity, jar and exit. The
+    ``profile_id`` must be the browser your client claims (``chrome-154-macos``
+    for scrapely.http Chrome 154 on macOS, ``chrome-146-macos`` for curl_cffi
+    ``impersonate="chrome146"``); a mismatch shows as ``_abck`` stuck at ``~-1~``.
+
+    Example::
+
+        http = AsyncClient(proxy_configuration=proxy, fingerprint_options=FingerprintOptions(
+            browsers=[{"name": "chrome", "min_version": 154, "max_version": 154}], operating_systems=["macos"]))
+        session = http.session(keep_identity=True)
+        akamai = AkamaiSensor(profile_id="chrome-154-macos")
+        home = await session.get("https://www.example.com/")
+        result = await akamai.solve(session, "https://www.example.com/", home.text)
+        page = await session.get("https://www.example.com/item/1")
+    """
+
+    def __init__(
+        self,
+        profile_id: str = "chrome-154-macos",
+        *,
+        telemetry: dict | None = None,
+        timeout: float = 90.0,
+        request_timeout: float = 30.0,
+        max_rounds: int = 12,
+    ) -> None:
+        self.profile_id = profile_id
+        self.telemetry = telemetry
+        self.timeout = timeout
+        self.request_timeout = request_timeout
+        self.max_rounds = max_rounds
+        self.sessions = 0
+        self.accepted = 0
+
+    @staticmethod
+    def _endpoint() -> tuple[str, str]:
+        env = solver_env()
+        if env is None:
+            raise VendorUnavailable("solver_not_enabled", "akamai", None, "the platform solver is not available to this run")
+        return env
+
+    # -- SBSD --------------------------------------------------------------------
+
+    async def solve_sbsd(self, session: Any, url: str, html: str) -> bool:
+        """Answers the SBSD bundle of `html` (the page `url` as your session got it). False when there is none."""
+        found = _sbsd_src(html, url)
+        if not found:
+            return False
+        src_attr, bundle_url = found
+        base, key = self._endpoint()
+        origin = f"{httpx.URL(url).scheme}://{httpx.URL(url).host}"
+        _, source = await _session_send(session, "GET", bundle_url, headers={"referer": url, "sec-fetch-dest": "script", "sec-fetch-mode": "no-cors", "sec-fetch-site": "same-origin", "accept": "*/*"}, body=None, kind="xhr", timeout=self.request_timeout)
+        cookie_header = "; ".join(f"{k}={v}" for k, v in _cookie_dict(session).items())
+        async with httpx.AsyncClient(timeout=self.timeout) as api:
+            r = await api.post(
+                f"{base}/akamai/sbsd/generate-session",
+                headers={"x-api-key": key},
+                json={"bundle": {"scriptSrc": src_attr, "source": source}, "document": {"url": url, "html": html, "cookieHeader": cookie_header}, "profile": {"id": self.profile_id}},
+            )
+        check_solver_response(r.status_code, r.text, r.headers.get("retry-after"))
+        data = _json(r.text)
+        rows = sorted([s for s in data.get("submissions") or [] if isinstance(s, dict) and s.get("resolvedUrl")], key=lambda s: s.get("index", 0))
+        if not rows:
+            raise SolveAttemptError(f"the SBSD ledger had no rows ({str(data.get('error') or data.get('outcome') or 'no reason')[:120]})")
+        for row in rows:
+            target = _urljoin(url, row["resolvedUrl"])
+            if not _step_allowed(target, url):
+                raise SolveAttemptError("the SBSD ledger pointed outside the target site; refused")
+            await _session_send(session, "POST", target, headers={"content-type": "text/plain;charset=UTF-8", "origin": origin, "referer": url, "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin", "accept": "*/*"}, body=row.get("body") or "", kind="xhr", timeout=self.request_timeout)
+        return True
+
+    # -- pixel channel (/akam/<n>/<hex> collector) -----------------------------------
+
+    async def solve_pixel(self, session: Any, url: str, html: str) -> bool:
+        """Answers Akamai's pixel channel of `html`: the collector script is fetched on your session, the solver
+        writes the POST the collector would send (``/akamai/pixel/generate``), and it is POSTed to the collector's
+        ``pixel_`` endpoint on your session. False when the page has no collector."""
+        collector = find_pixel_collector(html, url)
+        if not collector:
+            return False
+        base, key = self._endpoint()
+        origin = f"{httpx.URL(url).scheme}://{httpx.URL(url).host}"
+        _, source = await _session_send(session, "GET", collector, headers={"referer": url, "sec-fetch-dest": "script", "sec-fetch-mode": "no-cors", "sec-fetch-site": "same-origin", "accept": "*/*"}, body=None, kind="xhr", timeout=self.request_timeout)
+        cookie_header = "; ".join(f"{k}={v}" for k, v in _cookie_dict(session).items())
+        async with httpx.AsyncClient(timeout=self.timeout) as api:
+            r = await api.post(
+                f"{base}/akamai/pixel/generate",
+                headers={"x-api-key": key, "accept": "application/json"},
+                json={"document": {"url": url, "html": html, **({"cookieHeader": cookie_header} if cookie_header else {})},
+                      "profile": {"id": self.profile_id}, "script": {"source": source, "url": collector}},
+            )
+        check_solver_response(r.status_code, r.text, r.headers.get("retry-after"))
+        data = _json(r.text)
+        request = data.get("request") if isinstance(data.get("request"), dict) else {}
+        if not data.get("ok") or not isinstance(request.get("body"), str):
+            err = data.get("error") if isinstance(data.get("error"), dict) else {}
+            raise SolveAttemptError(f"the pixel route refused ({err.get('code') or r.status_code})")
+        # The collector's own endpoint, not the solver's reconstruction of it (the provider examples do the same).
+        target = pixel_target(collector)
+        await _session_send(session, "POST", target, headers={"content-type": request.get("contentType") or "application/x-www-form-urlencoded", "origin": origin, "referer": url, "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin", "accept": "*/*"}, body=request["body"], kind="xhr", timeout=self.request_timeout)
+        return True
+
+    # -- _abck sensor (WebSocket) ---------------------------------------------------
+
+    async def solve_abck(self, session: Any, url: str, html: str, *, script_url: str | None = None) -> SensorResult:
+        """Runs the ``_abck`` sensor rounds for the page `url` (its `html` as your session got it)."""
+        import websockets
+
+        script_url = script_url or find_sensor_script(html, url)
+        if not script_url:
+            return SensorResult(accepted=False, error="no Akamai sensor script in the page")
+        base, key = self._endpoint()
+        origin = f"{httpx.URL(url).scheme}://{httpx.URL(url).host}"
+        _, script = await _session_send(session, "GET", script_url, headers={"referer": url, "sec-fetch-dest": "script", "sec-fetch-mode": "no-cors", "sec-fetch-site": "same-origin", "accept": "*/*"}, body=None, kind="xhr", timeout=self.request_timeout)
+        init: dict[str, Any] = {
+            "type": "init", "url": url, "script": script, "scriptUrl": script_url, "html": _STRIP_SCRIPTS_RE.sub("", html or ""),
+            "cookies": _cookie_dict(session), "profileId": self.profile_id,
+        }
+        if self.telemetry:
+            init["profile"] = self.telemetry
+        ws_url = re.sub(r"^http", "ws", base, flags=re.I) + "/akamai/session"
+        result = SensorResult(accepted=False)
+        self.sessions += 1
+        deadline = time.monotonic() + self.timeout
+        try:
+            async with _ws_connect(ws_url, {"x-api-key": key}) as ws:
+                await ws.send(json.dumps(init))
+                while True:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        result.error = f"not accepted within {self.timeout:g}s"
+                        break
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=left)
+                    except asyncio.TimeoutError:
+                        result.error = f"not accepted within {self.timeout:g}s"
+                        break
+                    msg = _json(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
+                    kind = msg.get("type")
+                    if kind == "submission":
+                        result.submissions += 1
+                        if result.submissions > self.max_rounds:
+                            result.error = f"not accepted after {self.max_rounds} rounds"
+                            break
+                        target = str(msg.get("url") or "")
+                        headers = {k: v for k, v in (msg.get("headers") or {}).items() if k.lower() not in _OWN_HEADERS}
+                        headers.setdefault("origin", origin)
+                        headers.setdefault("referer", url)
+                        if not _step_allowed(target, url):
+                            await ws.send(json.dumps({"type": "submission_response", "id": msg.get("id"), "status": 0, "body": "Client error: refused a submission outside the target site"}))
+                            continue
+                        try:
+                            status, body = await _session_send(session, str(msg.get("method") or "POST"), target, headers=headers, body=msg.get("body") or "", kind="xhr", timeout=self.request_timeout)
+                        except Exception as exc:  # noqa: BLE001
+                            status, body = 0, f"Client error: {type(exc).__name__}"
+                        await ws.send(json.dumps({"type": "submission_response", "id": msg.get("id"), "status": status, "body": body, "cookies": _cookie_dict(session)}))
+                    elif kind == "cookie_update":
+                        result.rounds = int(msg.get("round") or result.rounds + 1)
+                        result.abck = abck_state((msg.get("cookies") or {}).get("_abck")) or result.abck
+                        if msg.get("accepted"):
+                            result.accepted = True
+                            break
+                    elif kind == "status" and str(msg.get("state") or "") == "accepted":
+                        result.accepted = True
+                        break
+                    elif kind == "error":
+                        result.error = str(msg.get("message") or msg.get("code") or "solver error")[:300]
+                        if msg.get("code") == "invalid_request":
+                            raise SolverRequestInvalid(result.error)
+        except websockets.exceptions.InvalidHandshake as exc:  # a refused upgrade carries the gateway's JSON error
+            status, body, retry_after = _refused_upgrade(exc)
+            if status:
+                check_solver_response(status, body, retry_after)
+            raise SolveAttemptError(f"solver session refused ({status or type(exc).__name__})") from exc
+        except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as exc:
+            if not result.accepted:
+                result.error = result.error or f"solver session failed: {type(exc).__name__}"
+        result.abck = abck_state(_cookie_dict(session).get("_abck")) or result.abck
+        if result.accepted:
+            self.accepted += 1
+        return result
+
+    async def solve(self, session: Any, url: str, html: str) -> SensorResult:
+        """SBSD when the page carries a bundle, then the ``_abck`` sensor (on the page as it is after SBSD)."""
+        if find_sbsd_bundle(html, url):
+            await self.solve_sbsd(session, url, html)
+            if not find_sensor_script(html, url) or len(html) < 5000:
+                _, html = await _session_send(session, "GET", url, headers={"referer": url}, body=None, kind="navigate", timeout=self.request_timeout)
+        return await self.solve_abck(session, url, html)

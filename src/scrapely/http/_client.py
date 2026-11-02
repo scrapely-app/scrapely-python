@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import random
 import threading
@@ -102,14 +103,30 @@ def _proxy_from_proxies(proxies: Any) -> Optional[str]:
 
 
 class _Pin:
-    """Holder of a pinned identity (a session)."""
+    """Holder of a pinned identity (a session).
 
-    __slots__ = ('identity', 'alock', 'tlock')
+    ``keep``: the identity is never retired or swapped by the client (no
+    rotation on a block or error, no usage/age expiry); only ``rotate()`` or
+    closing the session moves it to a new one.
+    """
 
-    def __init__(self) -> None:
+    __slots__ = ('identity', 'alock', 'tlock', 'keep')
+
+    def __init__(self, keep: bool = False) -> None:
         self.identity: Optional[Identity] = None
         self.alock: Optional[asyncio.Lock] = None
         self.tlock = threading.Lock()
+        self.keep = keep
+
+
+def _no_rotation(decision: Any) -> Any:
+    """The policy's decision with the rotation taken out (kept identities): stop here, retire nothing."""
+    try:
+        return dataclasses.replace(decision, retry=False, retire=False, delay=0.0)
+    except TypeError:
+        decision.retry = False
+        decision.retire = False
+        return decision
 
 
 class CookieStore:
@@ -522,7 +539,7 @@ class AsyncClient(_Base):
                 pin.alock = asyncio.Lock()
             async with pin.alock:
                 ident = pin.identity
-                if ident is not None and ident.expired(self._clock(), self.max_usage, self.max_age):
+                if ident is not None and not pin.keep and ident.expired(self._clock(), self.max_usage, self.max_age):
                     pin.identity = None
                     await self._retire(ident)
                     ident = None
@@ -558,6 +575,8 @@ class AsyncClient(_Base):
     async def _release(self, pin: Optional[_Pin], ident: Identity, retire: bool) -> None:
         ident.in_flight -= 1
         if pin is not None:
+            if pin.keep and pin.identity is ident:
+                return
             if retire or not self.sticky:
                 if pin.identity is ident:
                     pin.identity = None
@@ -658,12 +677,16 @@ class AsyncClient(_Base):
                 # Cancelled or failed in our own code: nothing says the identity is burnt.
                 await self._release(_pin, ident, retire=False)
                 raise
+            if decision.retry and not decision.same_identity and _pin is not None and _pin.keep:
+                # A kept identity is never swapped: the block or error goes back to the caller as is.
+                decision = _no_rotation(decision)
             if not decision.retry:
                 await self._release(_pin, ident, retire=decision.retire)
                 ok = resp is not None and reason is None and resp.status_code < 500
                 self._stats.record_request(ok)
                 if resp is None:
-                    assert error is not None
+                    if error is None:
+                        raise RuntimeError('scrapely.http: request ended with no response and no error')
                     raise error
                 resp.blocked = reason
                 return resp
@@ -703,14 +726,21 @@ class AsyncClient(_Base):
     async def options(self, url: str, **kwargs: Any) -> Response:
         return await self.request('OPTIONS', url, **kwargs)
 
-    def session(self) -> 'AsyncHttpSession':
+    def session(self, keep_identity: bool = False) -> 'AsyncHttpSession':
         """A pinned identity for multi-step flows (homepage → API with its cookies).
 
         All requests of the session use one profile, proxy session and cookie
         jar. On a block the whole identity is retired and the session continues
         on a fresh one (new IP, new profile, empty jar).
+
+        ``keep_identity=True`` keeps the identity and its jar on a block or an
+        error too: the blocked response comes back (``response.blocked`` names
+        the block) and the next request goes out on the same profile, exit and
+        cookies. That is what a challenge solve needs (the SBSD bundle, the
+        sensor submissions and the page fetches must share one identity).
+        ``rotate()`` moves the session to a fresh identity when you decide to.
         """
-        return AsyncHttpSession(self)
+        return AsyncHttpSession(self, keep_identity=keep_identity)
 
     async def aclose(self) -> None:
         if self._closed:
@@ -733,10 +763,20 @@ class AsyncClient(_Base):
 class AsyncHttpSession:
     """A pinned identity on an ``AsyncClient`` (see ``AsyncClient.session()``)."""
 
-    def __init__(self, client: AsyncClient) -> None:
+    def __init__(self, client: AsyncClient, keep_identity: bool = False) -> None:
         self._client = client
-        self._pin = _Pin()
+        self._pin = _Pin(keep=keep_identity)
         self.cookies = _SessionCookies(self)
+
+    @property
+    def keep_identity(self) -> bool:
+        return self._pin.keep
+
+    async def rotate(self) -> None:
+        """Retire the current identity; the next request opens a fresh one (new exit, profile and jar)."""
+        if self._pin.identity is not None:
+            ident, self._pin.identity = self._pin.identity, None
+            await self._client._retire(ident, force=ident.in_flight <= 0)
 
     @property
     def profile(self) -> Optional[str]:
@@ -873,7 +913,7 @@ class Client(_Base):
         if pin is not None:
             with pin.tlock:
                 ident = pin.identity
-                if ident is not None and ident.expired(self._clock(), self.max_usage, self.max_age):
+                if ident is not None and not pin.keep and ident.expired(self._clock(), self.max_usage, self.max_age):
                     pin.identity = None
                     self._retire(ident)
                     ident = None
@@ -918,6 +958,8 @@ class Client(_Base):
         with self._lock:
             ident.in_flight -= 1
         if pin is not None:
+            if pin.keep and pin.identity is ident:
+                return
             if retire or not self.sticky:
                 with pin.tlock:
                     if pin.identity is ident:
@@ -1023,12 +1065,15 @@ class Client(_Base):
                 # Failed in our own code: nothing says the identity is burnt.
                 self._release(_pin, ident, retire=False)
                 raise
+            if decision.retry and not decision.same_identity and _pin is not None and _pin.keep:
+                decision = _no_rotation(decision)
             if not decision.retry:
                 self._release(_pin, ident, retire=decision.retire)
                 ok = resp is not None and reason is None and resp.status_code < 500
                 self._stats.record_request(ok)
                 if resp is None:
-                    assert error is not None
+                    if error is None:
+                        raise RuntimeError('scrapely.http: request ended with no response and no error')
                     raise error
                 resp.blocked = reason
                 return resp
@@ -1067,9 +1112,9 @@ class Client(_Base):
     def options(self, url: str, **kwargs: Any) -> Response:
         return self.request('OPTIONS', url, **kwargs)
 
-    def session(self) -> 'HttpSession':
+    def session(self, keep_identity: bool = False) -> 'HttpSession':
         """A pinned identity for multi-step flows (see ``AsyncClient.session``)."""
-        return HttpSession(self)
+        return HttpSession(self, keep_identity=keep_identity)
 
     def close(self) -> None:
         if self._closed:
@@ -1090,10 +1135,21 @@ class Client(_Base):
 class HttpSession:
     """A pinned identity on a sync ``Client`` (see ``Client.session()``)."""
 
-    def __init__(self, client: Client) -> None:
+    def __init__(self, client: Client, keep_identity: bool = False) -> None:
         self._client = client
-        self._pin = _Pin()
+        self._pin = _Pin(keep=keep_identity)
         self.cookies = _SessionCookies(self)
+
+    @property
+    def keep_identity(self) -> bool:
+        return self._pin.keep
+
+    def rotate(self) -> None:
+        """Retire the current identity; the next request opens a fresh one (new exit, profile and jar)."""
+        with self._pin.tlock:
+            ident, self._pin.identity = self._pin.identity, None
+        if ident is not None:
+            self._client._retire(ident, force=ident.in_flight <= 0)
 
     @property
     def profile(self) -> Optional[str]:

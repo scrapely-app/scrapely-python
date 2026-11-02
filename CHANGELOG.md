@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.42] - 2026-11-02
+
+- **Sessions that keep their identity: `http.session(keep_identity=True)`.** A pinned `scrapely.http` session used to retire its identity on the first block (a 403, a challenge page, a network error). The session then moved to a new exit, a new profile and an empty cookie jar. That breaks every challenge solve: the challenge page, the solver's script and submission requests and the page fetched again must all share one identity. With `keep_identity=True`:
+  - a block comes back to the caller (`response.blocked` names it) and an error is raised, with no rotation;
+  - the next request goes out on the same profile, exit and jar, with the cookies the block set;
+  - `max_usage` / `max_age` do not retire it;
+  - `session.rotate()` moves the session to a fresh identity when you decide to.
+
+  The default (`keep_identity=False`) is unchanged. The option is available on `AsyncClient.session()` and `Client.session()`.
+- **`scrapely.solver.AkamaiSensor`: Akamai Bot Manager on your own session, the way the solver provider's examples do it.**
+  - `solve_sbsd(session, url, html)` handles a page that loads an SBSD bundle. It fetches the bundle on your session, gets the ledger from the solver (`/akamai/sbsd/generate-session`), then POSTs the ledger rows to the bundle path on your session.
+  - `solve_abck(session, url, html)` runs the `_abck` sensor over the solver's WebSocket session (`/akamai/session`, which the platform relays for runs). The solver generates each sensor; it is POSTed on your session with your client's own headers, and rounds continue until `_abck` is accepted (`~0~`).
+  - `solve()` does SBSD when the page carries a bundle, then `_abck`.
+
+  Use it with a `keep_identity=True` session (or one curl_cffi or httpx client), and set `profile_id` to the browser your client claims, e.g. `chrome-154-macos` for scrapely.http Chrome 154 on macOS. Submissions outside the target site are refused, and a refused session raises the platform's code (`VendorUnavailable`, `SolverRateLimited`, ...). Also new: `find_sensor_script()`, `find_sbsd_bundle()`, `abck_state()`, `SensorResult`.
+- **`AkamaiSensor.solve_pixel(session, url, html)`: Akamai's third channel, the pixel collector.** A page that loads `/akam/<n>/<hex>` (often next to an inline `bazadebezolkohpepadr=` value) expects that script to POST to `/akam/<n>/pixel_<hex>`. The collector is fetched on your session, the solver writes the POST the collector would send (`/akamai/pixel/generate`), and it is POSTed to the collector's own endpoint on your session. Also new: `find_pixel_collector()`, `pixel_target()`.
+
 ## [0.1.41] - 2026-10-29
 
 - **A refused charge names the limit that refused it.** When a charge is refused or cut short, the platform now says why (HTTP 402 `error.reason`, and `limitedBy` on a partial acceptance): the run's item limit (`maxItems`), its maximum total charge (`maxTotalChargeUsd`) or the account balance. The SDK used to call all of them the spending limit; a run stopped by its item limit logged "The spending limit of this run (maxTotalChargeUsd = $3.0) has been reached". Now:
