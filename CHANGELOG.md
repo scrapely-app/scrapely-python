@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.43] - 2026-11-05
+
+- **Browser patches are applied through an import hook.** `scrapely.patch_browser_pool` imports no browser library any more; it imports builtin modules only. Each patch now runs the moment its library finishes loading, before the import that loaded it returns. That covers the Crawlee BrowserPool / PlaywrightBrowserPlugin / PlaywrightCrawler, raw Playwright (`async_playwright` and `sync_playwright`, each when its module loads), Camoufox `AsyncNewBrowser` and pyppeteer `launch`. The patches behave exactly as before. The hook also:
+  - survives `importlib.util.find_spec()` availability checks and a failed first import;
+  - logs a warning when a patch fails instead of breaking the actor's import.
+
 ## [0.1.42] - 2026-11-02
 
 - **Sessions that keep their identity: `http.session(keep_identity=True)`.** A pinned `scrapely.http` session used to retire its identity on the first block (a 403, a challenge page, a network error). The session then moved to a new exit, a new profile and an empty cookie jar. That breaks every challenge solve: the challenge page, the solver's script and submission requests and the page fetched again must all share one identity. With `keep_identity=True`:

@@ -11,15 +11,29 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Sequence
 
-from scrapely_client import ApifyClientAsync
+if TYPE_CHECKING:
+    from scrapely_client import USES_PUSH_DATA_INTERCEPTION, ApifyClientAsync, push_data_charging_context
 
+    from .charging import ChargingManager
+
+# ``scrapely_client`` (219 pydantic models) loads only when a client is created
+# or one of its names below is used: ``Actor`` imports this module, and most
+# runs never create an API client.
+#
 # Re-exported so the SDK and the client share one marker attribute and one
 # context var. Identity matters: the client's intercepted ``push_items()``
 # reads/writes these, and the SDK detects interception via the attribute.
-from scrapely_client import USES_PUSH_DATA_INTERCEPTION, push_data_charging_context
+_CLIENT_NAMES = frozenset({'ApifyClientAsync', 'USES_PUSH_DATA_INTERCEPTION', 'push_data_charging_context'})
 
-if TYPE_CHECKING:
-    from .charging import ChargingManager
+
+def __getattr__(name: str) -> Any:
+    if name in _CLIENT_NAMES:
+        import scrapely_client
+
+        value = getattr(scrapely_client, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 __all__ = [
     'USES_PUSH_DATA_INTERCEPTION',
@@ -81,7 +95,7 @@ def create_charging_client(
     charging_manager: Optional['ChargingManager'] = None,
     default_dataset_id: Optional[str] = None,
     **kwargs: Any,
-) -> ApifyClientAsync:
+) -> 'ApifyClientAsync':
     """Create an ``ApifyClientAsync`` configured with the SDK's charging hooks.
 
     Args:
@@ -100,6 +114,8 @@ def create_charging_client(
         kwargs['api_url'] = api_url
     if api_public_url:
         kwargs['api_public_url'] = api_public_url
+
+    from scrapely_client import ApifyClientAsync
 
     charging_hooks = _ChargingManagerHooks(charging_manager) if charging_manager is not None else None
 

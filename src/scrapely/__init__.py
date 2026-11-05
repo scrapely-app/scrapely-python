@@ -10,95 +10,114 @@ Usage:
             await Actor.push_data({'url': actor_input['url']})
 """
 
-from typing import TYPE_CHECKING, Any
+from __future__ import annotations
+
+# ``typing`` is not imported at run time (see below): this package loads at
+# every interpreter start in actor images.
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Any
 
 # Side-effect: patch browser launches (Crawlee BrowserPool, PlaywrightCrawler,
 # raw Playwright, Camoufox, pyppeteer) to use the remote CDP browser (CDP_URL).
 # Must run on package import so `from scrapely import Actor` enables the patch
-# before any browser is launched (Node SDK parity). It does not import Crawlee:
-# the Crawlee patches are applied when Crawlee's browser modules load.
+# before any browser is launched (Node SDK parity). It imports none of those
+# libraries: each patch is applied the moment its library finishes loading.
 from .patch_browser_pool import set_cdp_url  # noqa: F401
 
-# Crawlee is NOT imported here: it costs ~1 s per run on the platform and many
-# actors never touch it. Everything that needs Crawlee (the re-exported Crawlee
-# classes, storage clients, events, request loaders) is resolved on first
-# attribute access by ``__getattr__`` below; ``Actor`` imports what it needs on
-# first use. Every ``from scrapely import X`` that worked before still works.
-from .actor import Actor
-from .configuration import Configuration
-from .charging_client import (
-    USES_PUSH_DATA_INTERCEPTION,
-    create_charging_client,
-    push_data_charging_context,
-)
-from .proxy_configuration import ProxyConfiguration
-from .browser_configuration import BrowserConfiguration
-from .charging import (
-    ChargingManager,
-    ChargeUncertainError,
-    ChargeRejectedError,
-    has_default_dataset_item_event_in_pricing,
-    is_default_dataset_item_event,
-    merge_charge_results,
-    push_data_and_charge,
-    resolve_default_dataset_item_event_name,
-    APIFY_DEFAULT_DATASET_ITEM_EVENT,
-    SCRAPELY_DEFAULT_DATASET_ITEM_EVENT,
-    DEFAULT_DATASET_ITEM_EVENT,
-)
+# Nothing else is imported here. The base images' sitecustomize imports
+# ``scrapely.patch_browser_pool`` (and so this package) in EVERY Python process
+# of an actor image; loading the whole SDK there cost ~0.75 s per interpreter
+# start at 1 CPU (5.7 s at 0.25 CPU). Every public name is resolved on first
+# attribute access by ``__getattr__`` below and cached in the module namespace,
+# so every ``from scrapely import X`` that worked before still works.
 
-from .types import (
-    ActorInput,
-    ActorPermissionLevel,
-    ActorRun,
-    ApifyEnv,
-    AbortOptions,
-    CallOptions,
-    ExitOptions,
-    InitOptions,
-    MetamorphOptions,
-    OpenStorageOptions,
-    ProxyInfo,
-    RebootOptions,
-    RecordOptions,
-    SetStatusMessageOptions,
-    StartOptions,
-    WebhookOptions,
-)
-
-from .webhook import (
-    Webhook,
-    WebhookEventType,
-)
-from .pricing_types import (
-    PricingModel,
-    FreeActorPricingInfo,
-    FlatPricePerMonthActorPricingInfo,
-    PricePerDatasetItemActorPricingInfo,
-    PayPerEventActorPricingInfo,
-    PricingPerEvent,
-    ActorPricingInfo,
-    ActorChargeEvent,
-    ChargeResult,
-    ActorPricingInfoResult,
-)
-from .errors import (
-    ScrapelyClientError,
-    ScrapelyApiError,
-    InvalidResponseBodyError,
-    InvalidRequestError,
-    UnauthorizedError,
-    ForbiddenError,
-    NotFoundError,
-    ConflictError,
-    RateLimitError,
-    ServerError,
-    raise_for_status,
-)
-
-# Public name -> (module, attribute) for names that need Crawlee. Loaded on
-# first access and cached in the module namespace.
+# Public name -> (module, attribute). Loaded on first access.
 _LAZY_ATTRS = {
+    'Actor': ('scrapely.actor', 'Actor'),
+    'Configuration': ('scrapely.configuration', 'Configuration'),
+    'ProxyConfiguration': ('scrapely.proxy_configuration', 'ProxyConfiguration'),
+    'BrowserConfiguration': ('scrapely.browser_configuration', 'BrowserConfiguration'),
+    # Charging client
+    **{
+        name: ('scrapely.charging_client', name)
+        for name in ('USES_PUSH_DATA_INTERCEPTION', 'create_charging_client', 'push_data_charging_context')
+    },
+    # Charging
+    **{
+        name: ('scrapely.charging', name)
+        for name in (
+            'ChargingManager',
+            'ChargeUncertainError',
+            'ChargeRejectedError',
+            'has_default_dataset_item_event_in_pricing',
+            'is_default_dataset_item_event',
+            'merge_charge_results',
+            'push_data_and_charge',
+            'resolve_default_dataset_item_event_name',
+            'APIFY_DEFAULT_DATASET_ITEM_EVENT',
+            'SCRAPELY_DEFAULT_DATASET_ITEM_EVENT',
+            'DEFAULT_DATASET_ITEM_EVENT',
+        )
+    },
+    # Types
+    **{
+        name: ('scrapely.types', name)
+        for name in (
+            'ActorInput',
+            'ActorPermissionLevel',
+            'ActorRun',
+            'ApifyEnv',
+            'AbortOptions',
+            'CallOptions',
+            'ExitOptions',
+            'InitOptions',
+            'MetamorphOptions',
+            'OpenStorageOptions',
+            'ProxyInfo',
+            'RebootOptions',
+            'RecordOptions',
+            'SetStatusMessageOptions',
+            'StartOptions',
+            'WebhookOptions',
+        )
+    },
+    # Webhook
+    'Webhook': ('scrapely.webhook', 'Webhook'),
+    'WebhookEventType': ('scrapely.webhook', 'WebhookEventType'),
+    # Pricing
+    **{
+        name: ('scrapely.pricing_types', name)
+        for name in (
+            'PricingModel',
+            'FreeActorPricingInfo',
+            'FlatPricePerMonthActorPricingInfo',
+            'PricePerDatasetItemActorPricingInfo',
+            'PayPerEventActorPricingInfo',
+            'PricingPerEvent',
+            'ActorPricingInfo',
+            'ActorChargeEvent',
+            'ChargeResult',
+            'ActorPricingInfoResult',
+        )
+    },
+    # Errors
+    **{
+        name: ('scrapely.errors', name)
+        for name in (
+            'ScrapelyClientError',
+            'ScrapelyApiError',
+            'InvalidResponseBodyError',
+            'InvalidRequestError',
+            'UnauthorizedError',
+            'ForbiddenError',
+            'NotFoundError',
+            'ConflictError',
+            'RateLimitError',
+            'ServerError',
+            'raise_for_status',
+        )
+    },
     # Crawlee re-exports
     'Request': ('crawlee', 'Request'),
     'RequestLoader': ('crawlee.request_loaders', 'RequestLoader'),
@@ -150,15 +169,28 @@ _LAZY_ATTRS = {
 }
 
 # Submodules that used to be loaded (and so bound as attributes) by this
-# package's eager imports; ``scrapely.events`` etc. keep working without an
-# explicit ``import scrapely.events``.
+# package's eager imports; ``scrapely.actor``, ``scrapely.events`` etc. keep
+# working without an explicit ``import scrapely.<name>``.
 _LAZY_SUBMODULES = frozenset({
+    '_browser_locations',
+    'actor',
+    'browser_configuration',
+    'cdp_retry',
+    'charging',
+    'charging_client',
+    'configuration',
+    'crypto',
+    'errors',
     'events',
     'log',
+    'pricing_types',
+    'proxy_configuration',
     'request_loaders',
     'storage',
     'storage_clients',
     'storages',
+    'types',
+    'webhook',
 })
 
 
@@ -193,6 +225,40 @@ if TYPE_CHECKING:  # Static analysers and IDEs see the lazy names as plain impor
     from crawlee.storage_clients.models import DatasetItemsListPage
     from crawlee.storages import Dataset, KeyValueStore, RequestQueue
 
+    from .actor import Actor
+    from .browser_configuration import BrowserConfiguration
+    from .charging import (
+        APIFY_DEFAULT_DATASET_ITEM_EVENT,
+        DEFAULT_DATASET_ITEM_EVENT,
+        SCRAPELY_DEFAULT_DATASET_ITEM_EVENT,
+        ChargeRejectedError,
+        ChargeUncertainError,
+        ChargingManager,
+        has_default_dataset_item_event_in_pricing,
+        is_default_dataset_item_event,
+        merge_charge_results,
+        push_data_and_charge,
+        resolve_default_dataset_item_event_name,
+    )
+    from .charging_client import (
+        USES_PUSH_DATA_INTERCEPTION,
+        create_charging_client,
+        push_data_charging_context,
+    )
+    from .configuration import Configuration
+    from .errors import (
+        ConflictError,
+        ForbiddenError,
+        InvalidRequestError,
+        InvalidResponseBodyError,
+        NotFoundError,
+        RateLimitError,
+        ScrapelyApiError,
+        ScrapelyClientError,
+        ServerError,
+        UnauthorizedError,
+        raise_for_status,
+    )
     from .events import (
         AbortingEvent,
         ActorEventTypes,
@@ -216,6 +282,19 @@ if TYPE_CHECKING:  # Static analysers and IDEs see the lazy names as plain impor
         SystemInfoEventData,
         UnknownEvent,
     )
+    from .pricing_types import (
+        ActorChargeEvent,
+        ActorPricingInfo,
+        ActorPricingInfoResult,
+        ChargeResult,
+        FlatPricePerMonthActorPricingInfo,
+        FreeActorPricingInfo,
+        PayPerEventActorPricingInfo,
+        PricePerDatasetItemActorPricingInfo,
+        PricingModel,
+        PricingPerEvent,
+    )
+    from .proxy_configuration import ProxyConfiguration
     from .request_loaders import ScrapelyRequestList
     from .storage import (
         ApiStorageClient,
@@ -226,8 +305,27 @@ if TYPE_CHECKING:  # Static analysers and IDEs see the lazy names as plain impor
         StorageClient,
         set_api_storage,
     )
+    from .types import (
+        AbortOptions,
+        ActorInput,
+        ActorPermissionLevel,
+        ActorRun,
+        ApifyEnv,
+        CallOptions,
+        ExitOptions,
+        InitOptions,
+        MetamorphOptions,
+        OpenStorageOptions,
+        ProxyInfo,
+        RebootOptions,
+        RecordOptions,
+        SetStatusMessageOptions,
+        StartOptions,
+        WebhookOptions,
+    )
+    from .webhook import Webhook, WebhookEventType
 
-__version__ = '0.1.41'
+__version__ = '0.1.43'
 __all__ = [
     # Core
     'Actor',

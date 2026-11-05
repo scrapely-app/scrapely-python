@@ -30,11 +30,11 @@ Mirrors the Node SDK ``patch-browser-pool.ts``:
   sandbox-safe Chromium args when running on the platform.
 - Soft no-op when Playwright/Crawlee browsers are not installed (e.g. HTTP-only
   actors).
-- Crawlee is never imported by this module (it costs ~1 s on the platform). The
-  Crawlee patches are applied at once when Crawlee's browser / Playwright
-  crawler modules are already loaded, otherwise by a post-import hook the
-  moment those modules finish loading — before actor code can use the classes.
-  The Playwright, Camoufox and pyppeteer patches are applied eagerly on import.
+- Neither Crawlee, Playwright, Camoufox nor pyppeteer is imported by this
+  module (the base images import it at every interpreter start). Each patch is
+  applied at once when its module is already loaded, otherwise by a
+  post-import hook the moment that module finishes loading — before actor code
+  can use what it patches.
 
 Location and proxy handling (the remote browser never takes a proxy):
 
@@ -67,19 +67,79 @@ Location and proxy handling (the remote browser never takes a proxy):
 from __future__ import annotations
 
 import contextvars
-import functools
-import importlib.abc
-import logging
 import os
-import re
 import sys
-from typing import Any, List, Optional, Tuple
-from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
-from ._browser_locations import subdivision_to_state_name
-from .cdp_retry import connect_with_retry_async, wrap_connect_over_cdp
+# This module is imported at EVERY interpreter start in actor images (base
+# image sitecustomize), before any actor code: it imports only builtin modules
+# at load time. Everything else (typing, logging, re, urllib.parse, functools,
+# asyncio via cdp_retry, the browser location table) loads on first use.
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Any, List, Optional, Tuple
+    from urllib.parse import SplitResult
 
-logger = logging.getLogger(__name__)
+
+class _LazyLogger:
+    """``logging.getLogger(__name__)``, imported on first use."""
+
+    def __getattr__(self, name: str) -> Any:
+        import logging
+
+        return getattr(logging.getLogger(__name__), name)
+
+
+logger = _LazyLogger()
+
+
+def urlsplit(*args: Any, **kwargs: Any) -> Any:
+    from urllib.parse import urlsplit as _urlsplit
+
+    return _urlsplit(*args, **kwargs)
+
+
+def urlunsplit(*args: Any, **kwargs: Any) -> Any:
+    from urllib.parse import urlunsplit as _urlunsplit
+
+    return _urlunsplit(*args, **kwargs)
+
+
+def parse_qsl(*args: Any, **kwargs: Any) -> Any:
+    from urllib.parse import parse_qsl as _parse_qsl
+
+    return _parse_qsl(*args, **kwargs)
+
+
+def urlencode(*args: Any, **kwargs: Any) -> Any:
+    from urllib.parse import urlencode as _urlencode
+
+    return _urlencode(*args, **kwargs)
+
+
+def unquote(*args: Any, **kwargs: Any) -> Any:
+    from urllib.parse import unquote as _unquote
+
+    return _unquote(*args, **kwargs)
+
+
+# ``cdp_retry`` pulls in asyncio and ``_browser_locations`` is a large table;
+# both are only needed once a browser is actually launched.
+def subdivision_to_state_name(country: Optional[str], subdivision: Optional[str]) -> Optional[str]:
+    from ._browser_locations import subdivision_to_state_name as _subdivision_to_state_name
+
+    return _subdivision_to_state_name(country, subdivision)
+
+
+def wrap_connect_over_cdp(*args: Any, **kwargs: Any) -> Any:
+    from .cdp_retry import wrap_connect_over_cdp as _wrap_connect_over_cdp
+
+    return _wrap_connect_over_cdp(*args, **kwargs)
+
+
+async def connect_with_retry_async(*args: Any, **kwargs: Any) -> Any:
+    from .cdp_retry import connect_with_retry_async as _connect_with_retry_async
+
+    return await _connect_with_retry_async(*args, **kwargs)
 
 _cdp_url: Optional[str] = None
 
@@ -219,7 +279,7 @@ def _redact_proxy_url(proxy_url: str) -> str:
     return f'{parts.scheme or "http"}://{userinfo}{parts.hostname}{port}'
 
 
-_COUNTRY_FRAGMENT_RE = re.compile(r'^country-([A-Za-z]{2})(?:_([A-Za-z0-9]{1,3}))?$')
+_COUNTRY_FRAGMENT_PATTERN = r'^country-([A-Za-z]{2})(?:_([A-Za-z0-9]{1,3}))?$'
 
 
 def _parse_proxy_url_location(proxy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -229,8 +289,10 @@ def _parse_proxy_url_location(proxy_url: Optional[str]) -> Tuple[Optional[str], 
     parts = _parse_proxy_url(str(proxy_url))
     if not parts or not parts.username:
         return None, None
+    import re
+
     for fragment in unquote(parts.username).split(','):
-        match = _COUNTRY_FRAGMENT_RE.match(fragment.strip())
+        match = re.match(_COUNTRY_FRAGMENT_PATTERN, fragment.strip())
         if match:
             subdivision = match.group(2)
             return match.group(1).upper(), subdivision.upper() if subdivision else None
@@ -474,6 +536,8 @@ def _apply_crawler_patch() -> None:
 
     if getattr(PlaywrightCrawler, '_scrapely_browser_config_patched', False):
         return
+
+    import functools
 
     _orig_init = PlaywrightCrawler.__init__
 
@@ -784,39 +848,46 @@ class _AsyncPlaywrightContextManagerProxy:
         return await self._cm.__aexit__(*exc)
 
 
-def _apply_raw_playwright_patch() -> None:
-    """Wrap playwright's sync/async entry points to redirect raw launches to CDP."""
+def _apply_raw_playwright_async_patch() -> None:
+    """Wrap ``playwright.async_api.async_playwright`` to redirect raw launches to CDP."""
     try:
         import playwright.async_api as playwright_async_api
     except ImportError:
-        playwright_async_api = None  # type: ignore[assignment]
+        return
 
-    if playwright_async_api is not None and not getattr(
-        playwright_async_api, '_scrapely_raw_cdp_patched', False
-    ):
-        orig_async = playwright_async_api.async_playwright
+    if getattr(playwright_async_api, '_scrapely_raw_cdp_patched', False):
+        return
+    orig_async = playwright_async_api.async_playwright
 
-        def async_playwright_patched() -> Any:
-            return _AsyncPlaywrightContextManagerProxy(orig_async())
+    def async_playwright_patched() -> Any:
+        return _AsyncPlaywrightContextManagerProxy(orig_async())
 
-        playwright_async_api.async_playwright = async_playwright_patched
-        playwright_async_api._scrapely_raw_cdp_patched = True  # type: ignore[attr-defined]
+    playwright_async_api.async_playwright = async_playwright_patched
+    playwright_async_api._scrapely_raw_cdp_patched = True  # type: ignore[attr-defined]
 
+
+def _apply_raw_playwright_sync_patch() -> None:
+    """Wrap ``playwright.sync_api.sync_playwright`` to redirect raw launches to CDP."""
     try:
         import playwright.sync_api as playwright_sync_api
     except ImportError:
-        playwright_sync_api = None  # type: ignore[assignment]
+        return
 
-    if playwright_sync_api is not None and not getattr(
-        playwright_sync_api, '_scrapely_raw_cdp_patched', False
-    ):
-        orig_sync = playwright_sync_api.sync_playwright
+    if getattr(playwright_sync_api, '_scrapely_raw_cdp_patched', False):
+        return
+    orig_sync = playwright_sync_api.sync_playwright
 
-        def sync_playwright_patched() -> Any:
-            return _SyncPlaywrightContextManagerProxy(orig_sync())
+    def sync_playwright_patched() -> Any:
+        return _SyncPlaywrightContextManagerProxy(orig_sync())
 
-        playwright_sync_api.sync_playwright = sync_playwright_patched
-        playwright_sync_api._scrapely_raw_cdp_patched = True  # type: ignore[attr-defined]
+    playwright_sync_api.sync_playwright = sync_playwright_patched
+    playwright_sync_api._scrapely_raw_cdp_patched = True  # type: ignore[attr-defined]
+
+
+def _apply_raw_playwright_patch() -> None:
+    """Wrap playwright's sync/async entry points to redirect raw launches to CDP."""
+    _apply_raw_playwright_async_patch()
+    _apply_raw_playwright_sync_patch()
 
 
 def _apply_pyppeteer_patch() -> None:
@@ -874,31 +945,59 @@ def _apply_pyppeteer_patch() -> None:
     pyppeteer_mod._scrapely_cdp_patched = True
 
 
-# ─── Crawlee patches without importing Crawlee ───────────────────────────────
+# ─── Patches applied when their library loads ────────────────────────────────
 #
-# Importing Crawlee costs ~1 s per run on the platform, so this module never
-# imports it. The Crawlee patches mutate classes in place, so they only have to
-# run before actor code uses those classes: they are applied immediately when
-# the defining modules are already loaded, otherwise by a post-import hook the
-# moment they finish executing (``import crawlee.browsers``,
-# ``from crawlee.crawlers import PlaywrightCrawler``, a PlaywrightCrawler built
-# by any template...). Behaviour is the same as applying them eagerly.
+# This module is imported at every interpreter start in actor images (base
+# image sitecustomize), so it never imports Crawlee, Playwright, Camoufox or
+# pyppeteer itself: importing them up front cost ~1 s per process on the
+# platform even when the actor never opens a browser. Every patch mutates a
+# module or class in place, so it only has to run before actor code can use
+# what it patches: it is applied at once when the defining module is already
+# loaded, otherwise by a post-import hook the moment that module finishes
+# executing, before the import statement that loaded it returns
+# (``import crawlee.browsers``, ``from crawlee.crawlers import
+# PlaywrightCrawler``, ``from playwright.async_api import async_playwright``, a
+# PlaywrightCrawler built by any template...). Behaviour is the same as
+# applying them eagerly.
 
 # Module name -> patch functions to run once that module has finished loading.
 # ``crawlee.browsers`` imports BrowserPool, PlaywrightBrowserController and
 # PlaywrightBrowserPlugin in its ``__init__``; any import of one of those
-# submodules runs that ``__init__`` to completion first.
-_CRAWLEE_POST_IMPORT_PATCHES: dict = {
+# submodules runs that ``__init__`` to completion first. Likewise importing
+# ``pyppeteer.launcher`` runs the ``pyppeteer`` package first, and the
+# ``camoufox`` package defines the ``AsyncNewBrowser`` the patch replaces.
+_POST_IMPORT_PATCHES: dict = {
     'crawlee.browsers': (_apply_patch,),
     'crawlee.crawlers._playwright._playwright_crawler': (_apply_crawler_patch,),
+    'playwright.async_api': (_apply_raw_playwright_async_patch,),
+    'playwright.sync_api': (_apply_raw_playwright_sync_patch,),
+    'camoufox': (_apply_camoufox_patch,),
+    'pyppeteer': (_apply_pyppeteer_patch,),
 }
+# Kept under its old name for code that inspects it.
+_CRAWLEE_POST_IMPORT_PATCHES = _POST_IMPORT_PATCHES
 
 
-class _PostImportLoader(importlib.abc.Loader):
+def _run_patches(module_name: str, patches: tuple) -> None:
+    """Run the patches for a loaded module; a failing patch never breaks the actor's import."""
+    for patch in patches:
+        try:
+            patch()
+        except Exception as exc:  # pragma: no cover - defensive (incompatible library version)
+            logger.warning(
+                '[scrapely] Could not patch %s for the remote browser (%s: %s)',
+                module_name,
+                type(exc).__name__,
+                exc,
+            )
+
+
+class _PostImportLoader:
     """Delegating loader that runs the Scrapely patches after the module executes."""
 
-    def __init__(self, loader: Any, patches: tuple) -> None:
+    def __init__(self, loader: Any, fullname: str, patches: tuple) -> None:
         self._loader = loader
+        self._fullname = fullname
         self._patches = patches
 
     def create_module(self, spec: Any) -> Any:
@@ -914,22 +1013,25 @@ class _PostImportLoader(importlib.abc.Loader):
         except Exception:
             pass
         self._loader.exec_module(module)
-        for patch in self._patches:
-            patch()
+        # The module loaded: patch it now, once. A failed load (the exception
+        # above) keeps the hook, so a later successful import is patched too.
+        if _POST_IMPORT_PATCHES.get(self._fullname) is self._patches:
+            _POST_IMPORT_PATCHES.pop(self._fullname, None)
+        _run_patches(self._fullname, self._patches)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._loader, name)
 
 
-class _CrawleePostImportFinder(importlib.abc.MetaPathFinder):
-    """Meta path finder that hooks the Crawlee modules in ``_CRAWLEE_POST_IMPORT_PATCHES``."""
+class _PostImportFinder:
+    """Meta path finder that hooks the modules in ``_POST_IMPORT_PATCHES``."""
 
     def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
-        patches = _CRAWLEE_POST_IMPORT_PATCHES.get(fullname)
+        patches = _POST_IMPORT_PATCHES.get(fullname)
         if patches is None:
             return None
         for finder in sys.meta_path:
-            if finder is self or isinstance(finder, _CrawleePostImportFinder):
+            if finder is self or isinstance(finder, _PostImportFinder):
                 continue
             find_spec = getattr(finder, 'find_spec', None)
             if find_spec is None:
@@ -941,25 +1043,25 @@ class _CrawleePostImportFinder(importlib.abc.MetaPathFinder):
             return None
         if spec.loader is None or not hasattr(spec.loader, 'exec_module'):
             return spec
-        # One-shot: the patches are idempotent, but a module loads only once.
-        _CRAWLEE_POST_IMPORT_PATCHES.pop(fullname, None)
-        spec.loader = _PostImportLoader(spec.loader, patches)
+        # The hook stays registered until the module has really loaded
+        # (``importlib.util.find_spec`` availability checks do not consume it).
+        spec.loader = _PostImportLoader(spec.loader, fullname, patches)
         return spec
 
 
-def _install_crawlee_patches() -> None:
-    """Apply the Crawlee patches now if Crawlee is loaded, else when it loads."""
-    for module_name in list(_CRAWLEE_POST_IMPORT_PATCHES):
+# Kept under its old name for code that inspects ``sys.meta_path``.
+_CrawleePostImportFinder = _PostImportFinder
+
+
+def _install_post_import_patches() -> None:
+    """Apply each patch now if its module is loaded, else when it loads."""
+    for module_name in list(_POST_IMPORT_PATCHES):
         if module_name in sys.modules:
-            for patch in _CRAWLEE_POST_IMPORT_PATCHES.pop(module_name):
-                patch()
-    if _CRAWLEE_POST_IMPORT_PATCHES and not any(
-        isinstance(finder, _CrawleePostImportFinder) for finder in sys.meta_path
-    ):
-        sys.meta_path.insert(0, _CrawleePostImportFinder())
+            _run_patches(module_name, _POST_IMPORT_PATCHES.pop(module_name))
+    if _POST_IMPORT_PATCHES and not any(isinstance(finder, _PostImportFinder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _PostImportFinder())
 
 
-_install_crawlee_patches()
-_apply_camoufox_patch()
-_apply_raw_playwright_patch()
-_apply_pyppeteer_patch()
+_install_crawlee_patches = _install_post_import_patches
+
+_install_post_import_patches()
