@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.44] - 2026-11-08
+
+- An atomic multi-event push (`Actor.push_data(rows, charges={...})`) whose charge the limit covers only in part no longer shows "Charging 5 instances of 'audio-minute' event would exceed the end of the account balance - only 3 events were charged". A row is saved only when all of its events are charged, so the SDK gives those 3 back and nothing is charged: the line was untrue. It now says what happened: "Saving this item needs 5 'audio-minute' event(s), but the account balance covers only 3: it was not saved and nothing was charged for it." When some rows still fit, it names how many were saved and charged in full, and when giving a charge back is not confirmed it says so instead of "nothing was charged". A plain `Actor.charge()` that comes back short keeps its line: those events do stay charged.
+- `ChargeResult.covered_counts` (alias `coveredCounts`, from `push_data(rows, charges={...})`): for each event whose charge came back short, how many events the limit covered (given back, not charged), e.g. `{'audio-minute': 3}`. Actors can cut a row to what the limit covers without reading the log.
+- Compatibility: actors that read N from the old line with a `logging.Filter` on the `scrapely.charging` logger still receive that exact line during the push. It is shown to the logger's filters only and never printed; when such a filter drops it, the SDK leaves the refusal message to the actor, as before. What is charged and saved does not change.
+- A spending limit of $0 (`max_total_charge_usd = 0`) is a real limit, the same as on the platform. It used to be read as "no limit". A missing or non-numeric value still means no limit.
+- `scrapely.solver`: a challenge step's answer is read as a stream and stops at the body size limit (httpx, requests and curl_cffi sessions), so a target site cannot make the step download an unbounded body.
+
 ## [0.1.43] - 2026-11-05
 
 - **Browser patches are applied through an import hook.** `scrapely.patch_browser_pool` imports no browser library any more; it imports builtin modules only. Each patch now runs the moment its library finishes loading, before the import that loaded it returns. That covers the Crawlee BrowserPool / PlaywrightBrowserPlugin / PlaywrightCrawler, raw Playwright (`async_playwright` and `sync_playwright`, each when its module loads), Camoufox `AsyncNewBrowser` and pyppeteer `launch`. The patches behave exactly as before. The hook also:

@@ -17,7 +17,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -228,6 +228,85 @@ def has_default_dataset_item_event_in_pricing(per_event_prices: dict) -> bool:
 hasDefaultDatasetItemEventInPricing = has_default_dataset_item_event_in_pricing
 
 
+# The SDK's line for a charge the platform accepted only in part. Outside an
+# atomic push it is true (the N events stay charged). Keep the wording: actors
+# read N from it (e.g. a logging.Filter on the 'scrapely.charging' logger).
+_LEGACY_SHORT_CHARGE_LINE = "Charging %s %s of '%s' event would exceed %s - only %s events were charged"
+
+
+class _ShortCharge:
+    """A charge of an atomic push that the limit accepted only in part (then given back)."""
+
+    __slots__ = ('event_name', 'requested', 'covered', 'limit', 'taken_by_filter')
+
+    def __init__(self, *, event_name: str, requested: int, covered: int, limit: str, taken_by_filter: bool) -> None:
+        self.event_name = event_name
+        self.requested = requested
+        self.covered = covered
+        self.limit = limit
+        self.taken_by_filter = taken_by_filter
+
+
+def _offer_to_log_filters(msg: str, args: tuple) -> bool:
+    """Show a log record to the 'scrapely.charging' logger's filters only; never print it.
+
+    Before 0.1.44 an atomic push logged the short-charge line (``only N events were
+    charged``) although it then gave that charge back. Actors that read N from that
+    line with a filter on this logger keep getting it, unchanged, while nobody sees
+    the untrue text. Returns True when a filter dropped the record: that actor then
+    reports the refusal itself, as it did before.
+    """
+    if not logger.filters or not logger.isEnabledFor(logging.INFO):
+        return False
+    try:
+        record = logger.makeRecord(logger.name, logging.INFO, __file__, 0, msg, args, None, func='_charge_exclusive')
+        return not logger.filter(record)
+    except Exception:  # noqa: BLE001 - an actor's filter must never break a push
+        return False
+
+
+def _items_phrase(count: int) -> tuple[str, str, str]:
+    """('this item', 'it was', 'it') or ('these 3 items', 'they were', 'them')."""
+    if count == 1:
+        return 'this item', 'it was', 'it'
+    return f'these {count} items', 'they were', 'them'
+
+
+def _log_atomic_refusal(
+    shorts: List[_ShortCharge], rows_pushed: int, rows_saved: int, given_back: bool
+) -> None:
+    """Log what an atomic push whose charge came back short really did."""
+    if not shorts or any(s.taken_by_filter for s in shorts):
+        return
+    first = shorts[0]
+    limit = re.sub(r'^the end of ', '', first.limit)
+    what, were, them = _items_phrase(rows_pushed)
+    head = (
+        f"Saving {what} needs {first.requested} '{first.event_name}' event(s), "
+        f'but {limit} covers only {first.covered}'
+    )
+    if rows_saved <= 0:
+        if given_back:
+            logger.info('%s: %s not saved and nothing was charged for %s.', head, were, them)
+        else:
+            logger.info(
+                '%s: %s not saved, but the %s event(s) charged for %s could not be given back yet '
+                '(see the warning about it).',
+                head, were, first.covered, them,
+            )
+        return
+    left = rows_pushed - rows_saved
+    _, left_were, left_them = _items_phrase(left)
+    tail = (
+        f'nothing was charged for {left_them}' if given_back
+        else f'what was charged for {left_them} could not be given back yet (see the warning about it)'
+    )
+    logger.info(
+        '%s: saved the first %s item(s), charged in full; the other %s %s not saved and %s.',
+        head, rows_saved, left, left_were.split()[-1], tail,
+    )
+
+
 def merge_charge_results(a: ChargeResult, b: ChargeResult) -> ChargeResult:
     """Merge two :class:`ChargeResult` objects (Node SDK ``mergeChargeResults`` parity).
 
@@ -299,6 +378,23 @@ class ChargeRejectedError(Exception):
         # Which run limit refused the charge (CHARGE_LIMIT_*), when the platform said.
         self.limit_reason = limit_reason
         self.max_items = max_items
+
+
+def _spending_limit_usd(value: Any) -> Optional[Decimal]:
+    """The run's spending limit (max_total_charge_usd), or None when uncapped.
+
+    0 is a real limit (no fees), the same as on the platform; only a missing
+    or non-numeric value means uncapped.
+    """
+    if value is None or value == '':
+        return None
+    try:
+        usd = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not usd.is_finite() or usd < 0:
+        return None
+    return usd
 
 
 class ChargingManager:
@@ -389,6 +485,10 @@ class ChargingManager:
         # definitively refused to void (event -> count): they stay billed, so the
         # next push of that event uses them instead of charging again.
         self._void_refused_credit: Dict[str, int] = {}
+        # Set by push_data_with_charges while it runs (it holds the operation
+        # lock): charges that came back short are collected here instead of being
+        # logged, because the atomic push gives them back (see _ShortCharge).
+        self._short_charges: Optional[List['_ShortCharge']] = None
 
     def close(self) -> None:
         """Mark the manager closed; subsequent charge/push operations are rejected."""
@@ -655,9 +755,8 @@ class ChargingManager:
 
         pricing_data = await self._fetch_pricing_data()
 
-        # Load max total charge (absent/zero means no cap — JS `|| Infinity` parity).
-        max_charge = pricing_data.get('max_total_charge_usd')
-        self._max_total_charge_usd = Decimal(str(max_charge)) if max_charge else None
+        # Load max total charge (absent means no cap; 0 is a real limit, as on the platform).
+        self._max_total_charge_usd = _spending_limit_usd(pricing_data.get('max_total_charge_usd'))
 
         # Load pricing info (env when complete, otherwise the run API at home).
         pricing_info_raw = pricing_data.get('pricing_info')
@@ -1399,15 +1498,21 @@ class ChargingManager:
 
         if chargeable_count < count:
             subject = 'instance' if count == 1 else 'instances'
-            logger.info(
-                "Charging %s %s of '%s' event would exceed %s - "
-                'only %s events were charged',
-                count,
-                subject,
-                event_name,
-                self._limit_name(),
-                chargeable_count,
-            )
+            legacy_args = (count, subject, event_name, self._limit_name(), chargeable_count)
+            sink = getattr(self, '_short_charges', None)
+            if sink is not None:
+                # Inside an atomic push: this charge is given back unless the row
+                # is saved, so "only N events were charged" would not be true.
+                # push_data_with_charges logs what really happened instead.
+                sink.append(_ShortCharge(
+                    event_name=event_name,
+                    requested=count,
+                    covered=chargeable_count,
+                    limit=self._limit_name(),
+                    taken_by_filter=_offer_to_log_filters(_LEGACY_SHORT_CHARGE_LINE, legacy_args),
+                ))
+            else:
+                logger.info(_LEGACY_SHORT_CHARGE_LINE, *legacy_args)
 
         return result
 
@@ -1516,8 +1621,8 @@ class ChargingManager:
         Returns:
             Maximum total charge in USD
         """
-        # No configured cap (or zero) means unlimited — JS returns Infinity.
-        return self._max_total_charge_usd if self._max_total_charge_usd else Decimal('Infinity')
+        # No configured cap means unlimited — JS returns Infinity.
+        return self._max_total_charge_usd if self._max_total_charge_usd is not None else Decimal('Infinity')
 
     def get_pricing_info(self) -> ActorPricingInfoResult:
         """Retrieve detailed pricing information for the current Actor run.
@@ -2164,8 +2269,13 @@ async def push_data_with_charges(
             rows = min(rows, max(0, int(remaining / row_cost)))
 
         ops: List[tuple] = []  # (event, charged, op_id, uncertain, paid_from_credit)
+        # Charges of this push that came back short: given back, and logged once
+        # the outcome is known (_log_atomic_refusal), not as "only N were charged".
+        shorts: List[_ShortCharge] = []
+        given_back = True
 
         async def undo(entries: List[tuple]) -> None:
+            nonlocal given_back
             for name, charged, op_id, uncertain, credit in entries:
                 if charged <= 0:
                     continue
@@ -2175,58 +2285,68 @@ async def push_data_with_charges(
                     charging_manager._unwind_reservation(name, charged)
                 else:
                     # Cancel / void; a refused void stays billed and becomes credit.
-                    await charging_manager._void_or_credit(name, op_id, charged, uncertain)
+                    if await charging_manager._void_or_credit(name, op_id, charged, uncertain) != 'voided':
+                        given_back = False
 
-        for _attempt in range(6):
-            if rows <= 0:
-                break
-            ops = []
-            short_to: Optional[int] = None
-            for name, n in sorted(per_row.items(), key=lambda kv: (is_default_dataset_item_event(kv[0]), kv[0])):
-                want = n * rows
-                charging_manager._take_last_accepted_operation_id()
-                if charging_manager._take_void_credit(name, want):
-                    # Paid by an earlier charge whose results were not stored (void refused).
-                    ops.append((name, want, None, False, True))
-                    continue
-                try:
-                    r = await charging_manager._charge_exclusive(name, want)
-                    op_id = charging_manager._take_last_accepted_operation_id()
-                    ops.append((name, r.charged_count, op_id, False, False))
-                    got = r.charged_count
-                except ChargeUncertainError as unconfirmed:
-                    # Not confirmed: the intent stays pending and is re-posted at exit,
-                    # so it counts as accepted (items stored, billed once).
-                    ops.append((name, unconfirmed.count, unconfirmed.operation_id, True, False))
-                    got = unconfirmed.count
-                if got < want:
-                    short_to = got // n
+        def covered_counts() -> Dict[str, int]:
+            # Per event: how many events the limit covered in its last short answer.
+            return {short.event_name: short.covered for short in shorts}
+
+        charging_manager._short_charges = shorts
+        try:
+            for _attempt in range(6):
+                if rows <= 0:
                     break
-            if short_to is None:
-                break
-            # Some event came back short: void this attempt in full and retry with
-            # the whole rows the budget covers at the FULL per-row cost. Sizing
-            # from the short event alone ignores the other events of the row, so
-            # the retry came back short again (appstore 64df0a3608d74af88: 20
-            # details -> 14, retry sized 14, app-item short, 0 saved). What this
-            # attempt was accepted is budget the void gives back; with the
-            # platform's remainingBudgetNd the local budget also knows the rest.
-            attempt_spent = sum(
-                (charging_manager._calculate_event_price(name) or Decimal('0')) * Decimal(charged)
-                for name, charged, _op, _unc, _credit in ops
-            )
-            await undo(ops)
-            ops = []
-            fit = int(attempt_spent / row_cost) if row_cost > 0 else 0
-            if charging_manager._platform_budget_seen and charging_manager._max_total_charge_usd is not None and row_cost > 0:
-                fit = max(fit, int(charging_manager._remaining_budget_usd() / row_cost))
-            # At least one more single-row try: without the platform's remaining
-            # budget the leftover after the short answer is unknown, and the last
-            # affordable row may still fit.
-            rows = min(rows - 1, max(fit, 1))
+                ops = []
+                short_to: Optional[int] = None
+                for name, n in sorted(per_row.items(), key=lambda kv: (is_default_dataset_item_event(kv[0]), kv[0])):
+                    want = n * rows
+                    charging_manager._take_last_accepted_operation_id()
+                    if charging_manager._take_void_credit(name, want):
+                        # Paid by an earlier charge whose results were not stored (void refused).
+                        ops.append((name, want, None, False, True))
+                        continue
+                    try:
+                        r = await charging_manager._charge_exclusive(name, want)
+                        op_id = charging_manager._take_last_accepted_operation_id()
+                        ops.append((name, r.charged_count, op_id, False, False))
+                        got = r.charged_count
+                    except ChargeUncertainError as unconfirmed:
+                        # Not confirmed: the intent stays pending and is re-posted at exit,
+                        # so it counts as accepted (items stored, billed once).
+                        ops.append((name, unconfirmed.count, unconfirmed.operation_id, True, False))
+                        got = unconfirmed.count
+                    if got < want:
+                        short_to = got // n
+                        break
+                if short_to is None:
+                    break
+                # Some event came back short: void this attempt in full and retry with
+                # the whole rows the budget covers at the FULL per-row cost. Sizing
+                # from the short event alone ignores the other events of the row, so
+                # the retry came back short again (appstore 64df0a3608d74af88: 20
+                # details -> 14, retry sized 14, app-item short, 0 saved). What this
+                # attempt was accepted is budget the void gives back; with the
+                # platform's remainingBudgetNd the local budget also knows the rest.
+                attempt_spent = sum(
+                    (charging_manager._calculate_event_price(name) or Decimal('0')) * Decimal(charged)
+                    for name, charged, _op, _unc, _credit in ops
+                )
+                await undo(ops)
+                ops = []
+                fit = int(attempt_spent / row_cost) if row_cost > 0 else 0
+                if charging_manager._platform_budget_seen and charging_manager._max_total_charge_usd is not None and row_cost > 0:
+                    fit = max(fit, int(charging_manager._remaining_budget_usd() / row_cost))
+                # At least one more single-row try: without the platform's remaining
+                # budget the leftover after the short answer is unknown, and the last
+                # affordable row may still fit.
+                rows = min(rows - 1, max(fit, 1))
+        finally:
+            charging_manager._short_charges = None
 
         if rows <= 0 or not ops:
             await undo(ops)
+            _log_atomic_refusal(shorts, len(rows_in), 0, given_back)
             charging_manager._mark_charge_limit_hit()
             if is_default_dataset:
                 charging_manager._note_refused_default_dataset_items(len(rows_in))
@@ -2234,6 +2354,7 @@ async def push_data_with_charges(
                 chargeable_within_limit=charging_manager.compute_chargeable(),
                 charged_count=0,
                 event_charge_limit_reached=True,
+                covered_counts=covered_counts(),
             )
 
         kept = rows_in if batch else rows_in[:rows]
@@ -2248,10 +2369,12 @@ async def push_data_with_charges(
             if _push_certainly_failed(push_err):
                 await undo(ops)
             raise
+        _log_atomic_refusal(shorts, len(rows_in), len(kept), given_back)
         return ChargeResult(
             chargeable_within_limit=charging_manager.compute_chargeable(),
             charged_count=len(kept),
             event_charge_limit_reached=len(kept) < len(rows_in) or charging_manager.is_charge_limit_reached(),
+            covered_counts=covered_counts(),
         )
 
 

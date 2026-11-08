@@ -612,11 +612,44 @@ def _checked(req: dict, target_url: str) -> dict:
     return req
 
 
+# Session libraries whose responses can be streamed (httpx: .stream(); the others: stream=True).
+_STREAM_LIBS = ("requests", "curl_cffi")
+
+
+def _session_lib(session: Any) -> str:
+    return type(session).__module__.split(".")[0]
+
+
+def _capped_text(buf: bytearray, encoding: str | None) -> str:
+    return bytes(buf[: _MAX_BODY + 1]).decode(encoding or "utf-8", errors="replace")
+
+
 def _send_sync(session: Any, req: dict, timeout: float) -> tuple[int, str]:
     body = req.get("body")
     kwargs: dict[str, Any] = {"headers": req.get("headers") or {}, "timeout": timeout}
     if body is not None:
         kwargs["content" if _is_httpx(session) else "data"] = body.encode() if isinstance(body, str) else body
+    # A step answer is read up to _MAX_BODY + 1 bytes: the target site decides its size.
+    lib = _session_lib(session)
+    if lib == "httpx":
+        with session.stream(req["method"], req["url"], **kwargs) as r:
+            buf = bytearray()
+            for chunk in r.iter_bytes():
+                buf += chunk
+                if len(buf) > _MAX_BODY:
+                    break
+            return int(r.status_code), _capped_text(buf, r.encoding)
+    if lib in _STREAM_LIBS:
+        r = session.request(req["method"], req["url"], stream=True, **kwargs)
+        try:
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf += chunk
+                if len(buf) > _MAX_BODY:
+                    break
+            return int(r.status_code), _capped_text(buf, r.encoding)
+        finally:
+            r.close()
     r = session.request(req["method"], req["url"], **kwargs)
     return _status_body(r)
 
@@ -626,6 +659,26 @@ async def _send_async(session: Any, req: dict, timeout: float) -> tuple[int, str
     kwargs: dict[str, Any] = {"headers": req.get("headers") or {}, "timeout": timeout}
     if body is not None:
         kwargs["content" if _is_httpx(session) else "data"] = body.encode() if isinstance(body, str) else body
+    lib = _session_lib(session)
+    if lib == "httpx":
+        async with session.stream(req["method"], req["url"], **kwargs) as r:
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                if len(buf) > _MAX_BODY:
+                    break
+            return int(r.status_code), _capped_text(buf, r.encoding)
+    if lib == "curl_cffi":
+        r = await session.request(req["method"], req["url"], stream=True, **kwargs)
+        try:
+            buf = bytearray()
+            async for chunk in r.aiter_content():
+                buf += chunk
+                if len(buf) > _MAX_BODY:
+                    break
+            return int(r.status_code), _capped_text(buf, r.encoding)
+        finally:
+            await r.aclose()
     r = await session.request(req["method"], req["url"], **kwargs)
     return _status_body(r)
 

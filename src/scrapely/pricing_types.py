@@ -126,6 +126,16 @@ class ChargeResult(BaseModel):
         alias='eventChargeLimitReached',
         description='If true, no more events of this type can be charged within the limit.'
     )
+    covered_counts: Dict[str, int] = Field(
+        default_factory=dict,
+        alias='coveredCounts',
+        description=(
+            "push_data(..., charges={...}) only: for each event whose charge came back short, how many "
+            "events the limit (account balance, maxTotalChargeUsd, maxItems) covered. A row is saved "
+            "only when all of its events are charged, so those events were given back, not charged. "
+            "Empty when no charge came back short."
+        ),
+    )
 
 
 class ActorPricingInfoResult(BaseModel):
