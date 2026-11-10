@@ -1829,6 +1829,40 @@ def _assert_items_serializable(items: List[Any]) -> None:
             raise ValueError(f'Dataset item at index {index} is not serializable to JSON: {err}') from err
 
 
+def _push_groups(rows: List[Any]) -> Optional[List[List[Any]]]:
+    """Rows of a push too big for one API request, split into pieces that fit.
+
+    ``None`` when the push fits one request (the usual case). A row larger than a
+    request raises DatasetItemTooLargeError (status 413) before anything is
+    charged or sent.
+    """
+    from .storage.client import DatasetItemTooLargeError, plan_dataset_push
+
+    try:
+        _parts, ranges = plan_dataset_push(rows)
+    except DatasetItemTooLargeError:
+        raise
+    except (TypeError, ValueError):
+        # Not serializable: the push itself reports it, naming the item.
+        return None
+    if ranges is None:
+        return None
+    return [rows[start:end] for start, end in ranges]
+
+
+def _merge_group_results(results: List[ChargeResult]) -> ChargeResult:
+    last = results[-1]
+    covered: Dict[str, int] = {}
+    for result in results:
+        covered.update(result.covered_counts)
+    return ChargeResult(
+        chargeable_within_limit=last.chargeable_within_limit,
+        charged_count=sum(result.charged_count for result in results),
+        event_charge_limit_reached=any(result.event_charge_limit_reached for result in results),
+        covered_counts=covered,
+    )
+
+
 async def push_data_and_charge(
     charging_manager: ChargingManager,
     items: Union[Dict[str, Any], List[Dict[str, Any]]],
@@ -1837,6 +1871,31 @@ async def push_data_and_charge(
     push_fn: Any,
 ) -> ChargeResult:
     """Push data to dataset and charge for each item.
+
+    A push larger than one API request (10 MiB of JSON) is charged and stored
+    piece by piece (pieces of at most 9 MiB, in order), each piece atomically as
+    a push of its own: a piece is billed only when it was stored. When a piece
+    fails, the earlier pieces stay stored and billed and the error is raised.
+    """
+    rows = items if isinstance(items, list) else [items]
+    groups = _push_groups(rows)
+    if groups is None:
+        return await _push_data_and_charge_one(charging_manager, rows, event_name, is_default_dataset, push_fn)
+    results = [
+        await _push_data_and_charge_one(charging_manager, group, event_name, is_default_dataset, push_fn)
+        for group in groups
+    ]
+    return _merge_group_results(results)
+
+
+async def _push_data_and_charge_one(
+    charging_manager: ChargingManager,
+    items: Union[Dict[str, Any], List[Dict[str, Any]]],
+    event_name: Optional[str],
+    is_default_dataset: bool,
+    push_fn: Any,
+) -> ChargeResult:
+    """Push data to dataset and charge for each item (one API request's worth).
 
     Limits items to remaining budget before push (JS parity).
 
@@ -2210,6 +2269,39 @@ async def push_data_with_charges(
 ) -> ChargeResult:
     """Push rows that each cost several events, atomically per row.
 
+    A ``charge_per='row'`` push larger than one API request (10 MiB of JSON) is
+    charged and stored piece by piece (at most 9 MiB each, in order), each piece
+    as a push of its own: a piece is billed only when it was stored, and when a
+    piece fails the earlier ones stay stored and billed and the error is raised.
+    A ``'batch'`` push is charged once and sent in pieces by the storage client.
+    See ``_push_data_with_charges_one`` for the per-push rules.
+    """
+    if charge_per == 'row':
+        rows = items if isinstance(items, list) else [items]
+        groups = _push_groups(rows) if rows else None
+        if groups is not None:
+            results = [
+                await _push_data_with_charges_one(
+                    charging_manager, group, charges, is_default_dataset, push_fn, charge_per
+                )
+                for group in groups
+            ]
+            return _merge_group_results(results)
+    return await _push_data_with_charges_one(
+        charging_manager, items, charges, is_default_dataset, push_fn, charge_per
+    )
+
+
+async def _push_data_with_charges_one(
+    charging_manager: ChargingManager,
+    items: Union[Dict[str, Any], List[Dict[str, Any]]],
+    charges: Dict[str, int],
+    is_default_dataset: bool,
+    push_fn: Any,
+    charge_per: str = 'row',
+) -> ChargeResult:
+    """Push rows that each cost several events, atomically per row.
+
     ``charge_per='batch'``: ``charges`` are charged ONCE for the whole push (e.g. one
     ``document`` for all of its page rows). If every event is accepted all rows are
     stored, otherwise none (and nothing stays billed). The prepaid-row balance is
@@ -2433,6 +2525,14 @@ def _push_certainly_failed(err: BaseException) -> bool:
     applied (``outcome_unknown``, set by the storage client's retries).
     """
     import httpx
+
+    from .storage.client import DatasetPushIncompleteError
+
+    if isinstance(err, DatasetPushIncompleteError):
+        # A push split by the storage client (only a charge_per='batch' push is
+        # this big) failed part-way: give its charge back rather than bill items
+        # that were not stored.
+        return True
 
     c: Optional[BaseException] = err
     for _ in range(4):

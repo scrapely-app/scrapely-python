@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.45] - 2026-11-09
+
+- **Dataset pushes larger than the API's 10 MiB request limit are stored instead of failing.** The API refuses a request body over 10 MiB (10,485,760 bytes) with `413`. `Actor.push_data(rows)` (and `Dataset.push_data`, crawler `context.push_data`) used to send all rows in one request, so a few big rows that each fitted (for example videos with many subtitle tracks) failed the whole push, and an actor that retried it failed the same way each time. A push that fits one request is sent exactly as before. A larger one is now sent in pieces of at most 9 MiB, in order, as the JS SDK does.
+- A charged push (`push_data(rows, charged_event_name=...)` or `charges={...}` per row) that big is charged and stored piece by piece, each piece as a push of its own: a piece is billed only when it was stored. If a piece fails, the earlier pieces stay stored and billed and the error is raised. A `charge_per='batch'` push is charged once; if one of its pieces fails, the charge is given back.
+- An uncharged push whose later piece fails raises `DatasetPushIncompleteError` (an `ApiClientError`) with `stored_items`: the first `stored_items` rows were stored.
+- A single item larger than one request (over 10 MiB as JSON) can never be stored. It now fails at once with `DatasetItemTooLargeError` (an `ApiClientError`, status `413`) naming the item's position, its size and the limit, for example "Dataset item at position 1 is 11010084 bytes as JSON, larger than the 10485760 bytes one push may hold, so it cannot be stored; nothing of this push was saved." Nothing of that push is sent or charged. Store large fields in the key-value store instead.
+
 ## [0.1.44] - 2026-11-08
 
 - An atomic multi-event push (`Actor.push_data(rows, charges={...})`) whose charge the limit covers only in part no longer shows "Charging 5 instances of 'audio-minute' event would exceed the end of the account balance - only 3 events were charged". A row is saved only when all of its events are charged, so the SDK gives those 3 back and nothing is charged: the line was untrue. It now says what happened: "Saving this item needs 5 'audio-minute' event(s), but the account balance covers only 3: it was not saved and nothing was charged for it." When some rows still fit, it names how many were saved and charged in full, and when giving a charge back is not confirmed it says so instead of "nothing was charged". A plain `Actor.charge()` that comes back short keeps its line: those events do stay charged.

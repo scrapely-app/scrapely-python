@@ -6,6 +6,7 @@ Ports the patterns from the TypeScript ApiStorageClient.
 
 from __future__ import annotations
 
+import json
 import os
 import logging
 import re
@@ -41,6 +42,89 @@ RQ_BATCH_SIZE = 25
 DEFAULT_LOCK_SECS = 180
 # Only needs to cover the update and unlock calls that follow the renewal.
 _RECLAIM_LOCK_SECS = 60
+
+
+# The API's JSON body limit (scrapely-server MAX_JSON_BODY_BYTES). A push whose
+# body is larger is refused whole with 413, so it is sent in pieces instead.
+DATASET_PUSH_MAX_BODY_BYTES = 10 * 1024 * 1024
+# Target size of each piece of a split push (the JS SDK's 9 MiB push chunks).
+DATASET_PUSH_CHUNK_BYTES = 9 * 1024 * 1024
+
+
+class DatasetItemTooLargeError(ApiClientError):
+    """A dataset item is larger than one push may be; nothing of the push was sent.
+
+    Carries status 413 like the API's own refusal, so callers (and the charging
+    code, which voids charges of a push that stored nothing) treat it the same.
+    """
+
+    def __init__(self, position: int, size: int, limit: int = DATASET_PUSH_MAX_BODY_BYTES):
+        super().__init__(
+            f'Dataset item at position {position} is {size} bytes as JSON, larger than the {limit} bytes '
+            'one push may hold, so it cannot be stored; nothing of this push was saved. '
+            'Make the item smaller (for example, store large fields in the key-value store).',
+            413,
+            {'error': {'type': 'request-too-large', 'itemPosition': position, 'itemBytes': size, 'maxBytes': limit}},
+        )
+        self.position = position
+        self.size = size
+        self.limit = limit
+
+
+class DatasetPushIncompleteError(ApiClientError):
+    """A split push failed part-way: its first ``stored_items`` items were stored, the rest not."""
+
+    def __init__(self, stored_items: int, total_items: int, cause: BaseException):
+        super().__init__(
+            f'Dataset push stored {stored_items} of {total_items} items before a part of it failed: {cause}',
+            getattr(cause, 'status_code', None) or 0,
+            getattr(cause, 'body', None),
+        )
+        self.stored_items = stored_items
+        self.total_items = total_items
+
+
+def _json_bytes(value: Any) -> bytes:
+    # Same serialization as ApiClient.request, so sizes are the bytes really sent.
+    return json.dumps(value, ensure_ascii=False, default=str).encode('utf-8')
+
+
+def _json_array(parts: Sequence[bytes]) -> bytes:
+    # Byte for byte what json.dumps writes for the list of these items.
+    return b'[' + b', '.join(parts) + b']'
+
+
+def plan_dataset_push(
+    items: Sequence[Any],
+    chunk_bytes: int = DATASET_PUSH_CHUNK_BYTES,
+    max_body_bytes: int = DATASET_PUSH_MAX_BODY_BYTES,
+) -> Tuple[List[bytes], Optional[List[Tuple[int, int]]]]:
+    """Serialize a push's items and decide whether it must be split.
+
+    Returns each item's JSON and ``None`` when the whole push fits one request
+    body (at most ``max_body_bytes``). Otherwise also the ``(start, end)`` index
+    ranges of the pieces to send in order, each at most ``chunk_bytes`` (an item
+    too big for that goes alone, in a body of up to ``max_body_bytes``). An item
+    larger than one body raises DatasetItemTooLargeError before anything is sent.
+    """
+    parts = [_json_bytes(item) for item in items]
+    total = 2 + sum(len(part) for part in parts) + 2 * max(0, len(parts) - 1)
+    if total <= max_body_bytes:
+        return parts, None
+    for position, part in enumerate(parts):
+        if len(part) + 2 > max_body_bytes:
+            raise DatasetItemTooLargeError(position, len(part), max_body_bytes)
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    size = 2  # '[' and ']'
+    for index, part in enumerate(parts):
+        extra = len(part) + (2 if index > start else 0)  # ', ' between items
+        if index > start and size + extra > chunk_bytes:
+            ranges.append((start, index))
+            start, size, extra = index, 2, len(part)
+        size += extra
+    ranges.append((start, len(parts)))
+    return parts, ranges
 
 
 def is_storage_uuid(value: str) -> bool:
@@ -205,10 +289,30 @@ class ApiStorageClient:
         dataset_id: str,
         items: Sequence[Mapping[str, Any]],
     ) -> None:
-        # One key per push, the same on every attempt: the API stores a re-sent
+        # One key per request, the same on every attempt: the API stores a re-sent
         # push once, so a push whose connection dropped can be retried.
-        await self.api_client.post_json(
-            f'/v2/datasets/{dataset_id}/items', list(items), idempotency_key=str(uuid.uuid4())
+        path = f'/v2/datasets/{dataset_id}/items'
+        rows = list(items)
+        parts, ranges = plan_dataset_push(rows)
+        if ranges is None:
+            await self._post_items(path, _json_array(parts))
+            return
+        # Over the API's body limit (the whole push would be refused with 413):
+        # send it in pieces of at most DATASET_PUSH_CHUNK_BYTES, in order.
+        for start, end in ranges:
+            try:
+                await self._post_items(path, _json_array(parts[start:end]))
+            except Exception as err:
+                if start:
+                    raise DatasetPushIncompleteError(start, len(rows), err) from err
+                raise
+
+    async def _post_items(self, path: str, body: bytes) -> None:
+        await self.api_client.post(
+            path,
+            content=body,
+            headers={'Content-Type': 'application/json'},
+            idempotency_key=str(uuid.uuid4()),
         )
 
     async def dataset_list_items(

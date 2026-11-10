@@ -325,7 +325,7 @@ if TYPE_CHECKING:  # Static analysers and IDEs see the lazy names as plain impor
     )
     from .webhook import Webhook, WebhookEventType
 
-__version__ = '0.1.44'
+__version__ = '0.1.45'
 __all__ = [
     # Core
     'Actor',
