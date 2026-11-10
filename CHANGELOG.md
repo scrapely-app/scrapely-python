@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.47] - 2026-11-10
+
+- **A resurrected or rebooted run no longer charges again for results it had already saved.** Such a run keeps its default dataset, but the Actor's code starts from the beginning, and an Actor without its own progress state collects the results it saved before once more. On the first charged push to the default dataset of such a run, the SDK reads the result key of the rows already saved (one read of the dataset's `id` values; `id` by default). A charged row whose key is one of them is not saved and not charged again: the dataset already holds it and it was paid for when it was first saved. It counts as accepted in the push result (`charged_count`) and in `get_charged_event_count()`, so Actors that compare pushed and charged counts do not stop. The run's spending limit is not used by these rows.
+  - `Actor.set_result_key('id' | ['id', 'checkIn'] | None)` names the field(s) that identify one result row; `None` turns this off. `SCRAPELY_RESUME_DEDUPE=off` turns it off for a run.
+  - Nothing changes when the key does not identify a row: if the saved rows repeat a key, or the resumed run pushes one key twice (for example the same result from two different searches), every row is saved and charged as before. Nothing changes in a first run, a run that saved nothing yet, after a metamorph, for rows without the key, for named datasets or for pushes that are not charged per row. A first run reads only the dataset's item count once.
+
 ## [0.1.46] - 2026-11-10
 
 - `scrapely.solver.AkamaiSensor.report(session, verified)`: after `solve_sbsd()` or `solve_pixel()`, re-fetch the page and report whether the site let the session through (`True`) or still showed its bot check (`False`). The platform stores it on that solve, the same way `Solver.report()` does for step solves, so a site that starts refusing these answers shows up in solver health and in the refusal alerts. Best effort: it never raises, and a second report for the same answer is ignored. Needs a platform that sends `x-scrapely-solve-id` on compat answers; on an older one it does nothing.

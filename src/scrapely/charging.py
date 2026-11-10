@@ -489,6 +489,9 @@ class ChargingManager:
         # lock): charges that came back short are collected here instead of being
         # logged, because the atomic push gives them back (see _ShortCharge).
         self._short_charges: Optional[List['_ShortCharge']] = None
+        # Rows of a resumed run that the run had already saved (and paid for)
+        # before: not saved or charged again, but counted as accepted (event -> count).
+        self._covered_earlier: Dict[str, int] = {}
 
     def close(self) -> None:
         """Mark the manager closed; subsequent charge/push operations are rejected."""
@@ -1608,12 +1611,24 @@ class ChargingManager:
         Returns:
             Number of events charged
         """
+        # Rows a resumed run had already saved count as charged: they were paid
+        # for when they were first saved (see resume_dedupe).
         if is_default_dataset_item_event(event_name):
             return (
                 self._charged_events.get(APIFY_DEFAULT_DATASET_ITEM_EVENT, 0)
                 + self._charged_events.get(SCRAPELY_DEFAULT_DATASET_ITEM_EVENT, 0)
+                + self._covered_earlier.get(APIFY_DEFAULT_DATASET_ITEM_EVENT, 0)
+                + self._covered_earlier.get(SCRAPELY_DEFAULT_DATASET_ITEM_EVENT, 0)
             )
-        return self._charged_events.get(event_name, 0)
+        return self._charged_events.get(event_name, 0) + self._covered_earlier.get(event_name, 0)
+
+    def _note_covered_earlier(self, event_names: List[str], count: int) -> None:
+        """Rows skipped because the resumed run saved them before: count them as accepted."""
+        if count <= 0:
+            return
+        for name in dict.fromkeys(event_names):
+            if name:
+                self._covered_earlier[name] = self._covered_earlier.get(name, 0) + count
 
     def get_max_total_charge_usd(self) -> Decimal:
         """Get the configured maximum total charge.
@@ -1878,14 +1893,78 @@ async def push_data_and_charge(
     fails, the earlier pieces stay stored and billed and the error is raised.
     """
     rows = items if isinstance(items, list) else [items]
-    groups = _push_groups(rows)
-    if groups is None:
-        return await _push_data_and_charge_one(charging_manager, rows, event_name, is_default_dataset, push_fn)
-    results = [
-        await _push_data_and_charge_one(charging_manager, group, event_name, is_default_dataset, push_fn)
-        for group in groups
-    ]
-    return _merge_group_results(results)
+
+    async def push(rows: List[Any]) -> ChargeResult:
+        groups = _push_groups(rows)
+        if groups is None:
+            return await _push_data_and_charge_one(charging_manager, rows, event_name, is_default_dataset, push_fn)
+        results = [
+            await _push_data_and_charge_one(charging_manager, group, event_name, is_default_dataset, push_fn)
+            for group in groups
+        ]
+        return _merge_group_results(results)
+
+    if not (is_default_dataset and rows and _paid_row_events(charging_manager, {event_name: 1} if event_name else {})):
+        return await push(rows)
+    return await _skip_saved_rows(
+        charging_manager, rows, _paid_row_events(charging_manager, {event_name: 1} if event_name else {}), push
+    )
+
+
+def _paid_row_events(charging_manager: ChargingManager, charges: Dict[str, int]) -> List[str]:
+    """Events a default-dataset push charges per row (empty: the push is not charged per row)."""
+    if charging_manager._pricing_info is None:
+        return []
+    names = [name for name in charges if name]
+    default_event = charging_manager._config.get('default_dataset_item_event_name') or (
+        resolve_default_dataset_item_event_name(charging_manager._per_event_prices)
+    )
+    if default_event:
+        names.append(default_event)
+    paid = [n for n in names if (charging_manager._calculate_event_price(n) or Decimal('0')) > 0]
+    if not paid:
+        return []
+    return list(dict.fromkeys(names))
+
+
+async def _skip_saved_rows(
+    charging_manager: ChargingManager,
+    rows: List[Any],
+    event_names: List[str],
+    push: Any,
+) -> ChargeResult:
+    """A charged default-dataset push of a resumed run: rows the run saved before are skipped.
+
+    See resume_dedupe. A skipped row is neither stored nor charged; it counts as
+    accepted in the result and in get_charged_event_count.
+    """
+    from .resume_dedupe import get_resume_dedupe
+
+    dedupe = get_resume_dedupe()
+    if not await dedupe.ensure(charging_manager):
+        return await push(rows)
+    async with dedupe.lock:
+        kept, skipped, pushed = dedupe.plan(rows)
+        if not skipped:
+            result = await push(kept)
+            dedupe.commit([], pushed[: max(0, result.charged_count)])
+            return result
+        if kept:
+            result = await push(kept)
+        else:
+            result = ChargeResult(
+                chargeable_within_limit=charging_manager.compute_chargeable(),
+                charged_count=0,
+                event_charge_limit_reached=charging_manager.is_charge_limit_reached(),
+            )
+        n = dedupe.commit(skipped, pushed[: max(0, result.charged_count)])
+        charging_manager._note_covered_earlier(event_names, n)
+        return ChargeResult(
+            chargeable_within_limit=result.chargeable_within_limit,
+            charged_count=result.charged_count + n,
+            event_charge_limit_reached=result.event_charge_limit_reached,
+            covered_counts=result.covered_counts,
+        )
 
 
 async def _push_data_and_charge_one(
@@ -2278,15 +2357,25 @@ async def push_data_with_charges(
     """
     if charge_per == 'row':
         rows = items if isinstance(items, list) else [items]
-        groups = _push_groups(rows) if rows else None
-        if groups is not None:
-            results = [
-                await _push_data_with_charges_one(
-                    charging_manager, group, charges, is_default_dataset, push_fn, charge_per
-                )
-                for group in groups
-            ]
-            return _merge_group_results(results)
+
+        async def push(rows: List[Any]) -> ChargeResult:
+            groups = _push_groups(rows) if rows else None
+            if groups is not None:
+                results = [
+                    await _push_data_with_charges_one(
+                        charging_manager, group, charges, is_default_dataset, push_fn, charge_per
+                    )
+                    for group in groups
+                ]
+                return _merge_group_results(results)
+            return await _push_data_with_charges_one(
+                charging_manager, rows, charges, is_default_dataset, push_fn, charge_per
+            )
+
+        paid = _paid_row_events(charging_manager, charges) if is_default_dataset and rows and isinstance(charges, dict) else []
+        if paid:
+            return await _skip_saved_rows(charging_manager, rows, paid, push)
+        return await push(rows)
     return await _push_data_with_charges_one(
         charging_manager, items, charges, is_default_dataset, push_fn, charge_per
     )

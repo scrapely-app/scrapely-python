@@ -1011,6 +1011,20 @@ class Actor(metaclass=_ActorMeta):
         )
 
     @classmethod
+    def set_result_key(cls, key: Union[str, List[str], None]) -> None:
+        """Name the field(s) that identify one result row (default ``'id'``).
+
+        When a run is resurrected or rebooted, the Actor's code starts again and
+        often collects results it already saved. A charged push to the default
+        dataset then skips rows whose key the run saved before: they are not
+        saved or charged again, and count as accepted. Use a list for a key made
+        of several fields (``['id', 'checkIn']``) and ``None`` to turn this off.
+        """
+        from .resume_dedupe import get_resume_dedupe
+
+        get_resume_dedupe().set_result_key(key)
+
+    @classmethod
     async def get_value(cls, key: str, default_value: Any = None) -> Any:
         cls._ensure_initialized('get_value')
         if cls._default_kvs is None:
