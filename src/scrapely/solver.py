@@ -95,6 +95,8 @@ DEGRADED_STATUS_MESSAGE = "Site protection temporarily unavailable, results may 
 UNAVAILABLE_CODES = ("vendor_degraded", "vendor_down", "provider_unavailable", "vendor_unsupported", "solver_not_enabled")
 
 _COMPAT_SUFFIXES = ("/compat/v1",)
+# Header of a compat solve answer: the id its verification is reported under (POST …/solves/<id>/outcome).
+_SOLVE_ID_HEADER = "x-scrapely-solve-id"
 _STATUS_TTL_SECS = 15.0
 _MAX_BODY = 4 * 1024 * 1024
 
@@ -1117,6 +1119,10 @@ class AkamaiSensor:
         home = await session.get("https://www.example.com/")
         result = await akamai.solve(session, "https://www.example.com/", home.text)
         page = await session.get("https://www.example.com/item/1")
+
+    After an SBSD or pixel answer, tell the platform whether the site accepted it:
+    ``await akamai.report(session, page_is_usable)``. That keeps the site's refusal rate visible in
+    solver health and alerts.
     """
 
     def __init__(
@@ -1135,6 +1141,8 @@ class AkamaiSensor:
         self.max_rounds = max_rounds
         self.sessions = 0
         self.accepted = 0
+        # The platform's id for the latest SBSD / pixel answer per session (see `report`).
+        self._solve_ids: dict[int, str] = {}
 
     @staticmethod
     def _endpoint() -> tuple[str, str]:
@@ -1142,6 +1150,32 @@ class AkamaiSensor:
         if env is None:
             raise VendorUnavailable("solver_not_enabled", "akamai", None, "the platform solver is not available to this run")
         return env
+
+    # -- verification ------------------------------------------------------------
+
+    def _remember(self, session: Any, response: Any) -> None:
+        solve_id = response.headers.get(_SOLVE_ID_HEADER)
+        if solve_id:
+            self._solve_ids[id(session)] = str(solve_id)[:64]
+
+    async def report(self, session: Any, verified: bool) -> None:
+        """Report whether the site let `session` through after its latest SBSD or pixel answer.
+
+        Call it after you re-fetched the page: ``True`` when the page came back, ``False`` when the bot
+        check was still there. The platform stores it on that solve, so a site that starts refusing these
+        answers shows up in solver health and alerts. Best effort: never raises, and a second report for
+        the same answer is ignored.
+        """
+        solve_id = self._solve_ids.pop(id(session), None)
+        gw = _gateway()
+        if not solve_id or gw is None:
+            return
+        base, key = gw
+        try:
+            async with httpx.AsyncClient(timeout=15) as api:
+                await api.post(f"{base}/solves/{solve_id}/outcome", json={"verified": bool(verified)}, headers={"authorization": f"Bearer {key}"})
+        except Exception:  # noqa: BLE001 - reporting is best effort
+            pass
 
     # -- SBSD --------------------------------------------------------------------
 
@@ -1162,6 +1196,7 @@ class AkamaiSensor:
                 json={"bundle": {"scriptSrc": src_attr, "source": source}, "document": {"url": url, "html": html, "cookieHeader": cookie_header}, "profile": {"id": self.profile_id}},
             )
         check_solver_response(r.status_code, r.text, r.headers.get("retry-after"))
+        self._remember(session, r)
         data = _json(r.text)
         rows = sorted([s for s in data.get("submissions") or [] if isinstance(s, dict) and s.get("resolvedUrl")], key=lambda s: s.get("index", 0))
         if not rows:
@@ -1194,6 +1229,7 @@ class AkamaiSensor:
                       "profile": {"id": self.profile_id}, "script": {"source": source, "url": collector}},
             )
         check_solver_response(r.status_code, r.text, r.headers.get("retry-after"))
+        self._remember(session, r)
         data = _json(r.text)
         request = data.get("request") if isinstance(data.get("request"), dict) else {}
         if not data.get("ok") or not isinstance(request.get("body"), str):

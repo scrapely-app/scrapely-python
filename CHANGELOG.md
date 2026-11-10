@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.46] - 2026-11-10
+
+- `scrapely.solver.AkamaiSensor.report(session, verified)`: after `solve_sbsd()` or `solve_pixel()`, re-fetch the page and report whether the site let the session through (`True`) or still showed its bot check (`False`). The platform stores it on that solve, the same way `Solver.report()` does for step solves, so a site that starts refusing these answers shows up in solver health and in the refusal alerts. Best effort: it never raises, and a second report for the same answer is ignored. Needs a platform that sends `x-scrapely-solve-id` on compat answers; on an older one it does nothing.
+
 ## [0.1.45] - 2026-11-09
 
 - **Dataset pushes larger than the API's 10 MiB request limit are stored instead of failing.** The API refuses a request body over 10 MiB (10,485,760 bytes) with `413`. `Actor.push_data(rows)` (and `Dataset.push_data`, crawler `context.push_data`) used to send all rows in one request, so a few big rows that each fitted (for example videos with many subtitle tracks) failed the whole push, and an actor that retried it failed the same way each time. A push that fits one request is sent exactly as before. A larger one is now sent in pieces of at most 9 MiB, in order, as the JS SDK does.
