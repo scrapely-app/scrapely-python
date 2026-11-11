@@ -17,6 +17,13 @@ The key must identify a row. When the saved rows repeat a key, or this run
 pushes one key twice, it does not, and the run goes on as before: every row is
 stored and charged. Nothing is skipped in a first run, in a run that saved
 nothing yet, after a metamorph, or for pushes that are not charged per row.
+
+A resumed generation also starts the Actor's own result count from zero. An
+Actor that declares its run-level result limit (``Actor.set_result_limit(n)``,
+e.g. its ``maxItems`` input) gets it applied across generations: once the rows
+saved before plus the new rows of this generation reach ``n``, further charged
+rows are refused like at the spending limit (not stored, not charged, and the
+push reports the limit), so the run ends with ``n`` results, not more.
 """
 
 from __future__ import annotations
@@ -88,6 +95,13 @@ class ResumeDedupe:
         self._skipped = 0
         self._announced = False
         self._lock = asyncio.Lock()
+        # Run-level result limit the Actor declared (None: not declared).
+        self._limit: Optional[int] = None
+        # Rows the default dataset held when this resumed generation started (None: not a resumed run).
+        self._resumed_rows: Optional[int] = None
+        # New rows this generation stored through charged pushes.
+        self._new_rows = 0
+        self._limit_announced = False
 
     # Actor API
     def set_result_key(self, key: Union[str, Sequence[str], None]) -> None:
@@ -99,6 +113,33 @@ class ResumeDedupe:
                 self._state = 'unknown'
                 self._saved = set()
                 self._seen = set()
+
+    def set_result_limit(self, limit: Optional[int]) -> None:
+        if limit is None:
+            self._limit = None
+            return
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError('result limit must be a positive integer or None')
+        self._limit = limit
+
+    def remaining(self) -> Optional[int]:
+        """New rows this resumed generation may still store under the declared limit (None: no cap)."""
+        if self._limit is None or self._resumed_rows is None:
+            return None
+        return max(0, self._limit - self._resumed_rows - self._new_rows)
+
+    def note_new_rows(self, count: int) -> None:
+        if count > 0:
+            self._new_rows += count
+
+    def note_capped(self) -> None:
+        if not self._limit_announced:
+            self._limit_announced = True
+            logger.info(
+                'This run was resumed with %s results saved before; it stops at its limit of %s results',
+                self._resumed_rows,
+                self._limit,
+            )
 
     @property
     def skipped(self) -> int:
@@ -122,9 +163,9 @@ class ResumeDedupe:
         if self._state != 'unknown':
             return
         self._state = 'off'
-        if self._fields is None:
-            return
         if (os.environ.get('SCRAPELY_RESUME_DEDUPE') or '').strip().lower() in _OFF_VALUES:
+            return
+        if self._fields is None and self._limit is None:
             return
         client = getattr(manager, '_client', None)
         run_id = getattr(manager, '_actor_run_id', None)
@@ -143,6 +184,9 @@ class ResumeDedupe:
             resumed = sum(int(stats.get(k) or 0) for k in ('resurrectCount', 'rebootCount'))
             if resumed <= 0 or int(stats.get('metamorph') or 0) > 0:
                 return
+            self._resumed_rows = item_count
+            if self._fields is None:
+                return  # no result key: only the declared limit applies
             if item_count > MAX_SAVED_ROWS:
                 logger.info(
                     'This run was resumed with %s saved results, more than the %s the SDK reads to skip '
@@ -183,10 +227,11 @@ class ResumeDedupe:
         self._state = 'on'
 
     async def ensure(self, manager: Any) -> bool:
+        """True when this push needs the resumed-run path (saved rows to skip, or a declared limit)."""
         if self._state == 'unknown':
             async with self._lock:
                 await self._load(manager)
-        return self._state == 'on'
+        return self._state == 'on' or self.remaining() is not None
 
     @property
     def lock(self) -> asyncio.Lock:

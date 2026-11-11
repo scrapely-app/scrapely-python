@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.48] - 2026-11-10
+
+- **A resurrected or rebooted run stops at the Actor's own result limit.** A resumed run starts the Actor's code again, and with it the Actor's own result count, so an Actor whose source returns results in a different order each run (search pages, feeds) could end with more results than its limit: with `maxResults` 60, 24 rows saved before the abort plus the resumed run's own 60 (some of them saved before and skipped) gave 67. `Actor.set_result_limit(n)` declares the Actor's run-level result limit, e.g. its `maxItems` input. In a resumed run the rows saved before count towards it: once they and the new rows reach `n`, further charged rows are refused like at the spending limit (not saved, not charged, the push reports the limit), so the run ends with `n` results. Declare only a limit that counts all results of the run, not one per search. Nothing changes in a first run or for Actors that do not declare a limit.
+
 ## [0.1.47] - 2026-11-10
 
 - **A resurrected or rebooted run no longer charges again for results it had already saved.** Such a run keeps its default dataset, but the Actor's code starts from the beginning, and an Actor without its own progress state collects the results it saved before once more. On the first charged push to the default dataset of such a run, the SDK reads the result key of the rows already saved (one read of the dataset's `id` values; `id` by default). A charged row whose key is one of them is not saved and not charged again: the dataset already holds it and it was paid for when it was first saved. It counts as accepted in the push result (`charged_count`) and in `get_charged_event_count()`, so Actors that compare pushed and charged counts do not stop. The run's spending limit is not used by these rows.

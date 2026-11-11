@@ -1945,9 +1945,17 @@ async def _skip_saved_rows(
         return await push(rows)
     async with dedupe.lock:
         kept, skipped, pushed = dedupe.plan(rows)
-        if not skipped:
+        # The Actor's declared run-level limit counts the rows saved before.
+        room = dedupe.remaining()
+        capped = room is not None and len(kept) > room
+        if capped:
+            kept, pushed = kept[:room], pushed[:room]
+            dedupe.note_capped()
+        if not skipped and not capped:
             result = await push(kept)
-            dedupe.commit([], pushed[: max(0, result.charged_count)])
+            stored = max(0, result.charged_count)
+            dedupe.commit([], pushed[:stored])
+            dedupe.note_new_rows(stored)
             return result
         if kept:
             result = await push(kept)
@@ -1957,12 +1965,14 @@ async def _skip_saved_rows(
                 charged_count=0,
                 event_charge_limit_reached=charging_manager.is_charge_limit_reached(),
             )
-        n = dedupe.commit(skipped, pushed[: max(0, result.charged_count)])
+        stored = max(0, result.charged_count)
+        n = dedupe.commit(skipped, pushed[:stored])
+        dedupe.note_new_rows(stored)
         charging_manager._note_covered_earlier(event_names, n)
         return ChargeResult(
             chargeable_within_limit=result.chargeable_within_limit,
             charged_count=result.charged_count + n,
-            event_charge_limit_reached=result.event_charge_limit_reached,
+            event_charge_limit_reached=result.event_charge_limit_reached or capped,
             covered_counts=result.covered_counts,
         )
 
