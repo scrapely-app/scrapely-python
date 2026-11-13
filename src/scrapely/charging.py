@@ -568,6 +568,26 @@ class ChargingManager:
         """The platform accepted fewer events than asked: record which limit cut it."""
         self._mark_charge_limit_hit(self._last_limited_by, self._last_limit_max_items)
 
+    def _limit_reported(self, event_name: Optional[str] = None) -> bool:
+        """``event_charge_limit_reached`` for a charge or push that the limit did not cut.
+
+        True only once a limit of this run really refused or cut a charge or
+        dropped rows, and (for ``event_name``) not one more such event fits.
+        A charge that is accepted in full but leaves less than one more event
+        of room reports False: the run has not been stopped by its limit, and
+        an Actor that already has everything it was asked for ends with its
+        own status message instead of "stopped because the maximum charge
+        was reached". If it does go on, its next charge or push is refused,
+        and that result reports True. ``chargeable_within_limit``,
+        ``calculate_max_event_charge_count_within_limit()`` and
+        ``is_charge_limit_reached()`` still tell how much room is left.
+        """
+        if not self._charge_limit_hit:
+            return False
+        if event_name is None:
+            return True
+        return self._is_event_limit_reached(event_name)
+
     def _max_items_setting(self) -> Optional[int]:
         """The run's item limit: as the platform reported it, else ACTOR_MAX_PAID_DATASET_ITEMS."""
         if self._charge_limit_max_items is not None:
@@ -646,6 +666,7 @@ class ChargingManager:
         """Count rows dropped because of the limit; warn on the first one only."""
         if count <= 0:
             return
+        self._mark_charge_limit_hit()
         if not self._refused_default_dataset_items:
             name = self._limit_name()
             logger.warning(
@@ -1428,7 +1449,7 @@ class ChargingManager:
             result = ChargeResult(
                 chargeable_within_limit=self._compute_chargeable(),
                 charged_count=chargeable_count,
-                event_charge_limit_reached=self._is_event_limit_reached(event_name),
+                event_charge_limit_reached=self._limit_reported(event_name),
             )
 
         # Record charge with the platform.
@@ -1462,7 +1483,7 @@ class ChargingManager:
                     result = ChargeResult(
                         chargeable_within_limit=self._compute_chargeable(),
                         charged_count=chargeable_count,
-                        event_charge_limit_reached=self._is_event_limit_reached(event_name),
+                        event_charge_limit_reached=True,
                     )
                 self._sync_platform_budget()
                 if self._max_total_charge_usd is not None and self._platform_other_usd > 0:
@@ -1471,7 +1492,7 @@ class ChargingManager:
                         chargeable_within_limit=self._compute_chargeable(),
                         charged_count=result.charged_count,
                         event_charge_limit_reached=result.event_charge_limit_reached
-                        or self._is_event_limit_reached(event_name),
+                        or self._limit_reported(event_name),
                     )
             else:
                 # Not confirmed: keep a durable copy so a crash before the next
@@ -1969,7 +1990,7 @@ async def _skip_saved_rows(
             result = ChargeResult(
                 chargeable_within_limit=charging_manager.compute_chargeable(),
                 charged_count=0,
-                event_charge_limit_reached=charging_manager.is_charge_limit_reached(),
+                event_charge_limit_reached=charging_manager._limit_reported(),
             )
         stored = max(0, result.charged_count)
         n = dedupe.commit(skipped, pushed[:stored])
@@ -2033,7 +2054,8 @@ async def _push_data_and_charge_one(
         # budget cap stores only the rows that are actually charged.
         # Rows the Actor already paid for with an earlier charge() (charge first,
         # then a plain push) are still stored: see ChargingManager._take_unpaid_rows.
-        # The result still reports the limit, so the Actor stops after them.
+        # The result reports the limit once it refused something (these rows or
+        # an earlier charge), so the Actor stops after them; see _limit_reported.
         unpaid_past_limit = False
         if (
             is_ppe
@@ -2041,7 +2063,6 @@ async def _push_data_and_charge_one(
             and items
             and not _push_is_paid_per_item(charging_manager, event_name, resolved_event)
         ):
-            unpaid_past_limit = charging_manager.is_charge_limit_reached()
             allowed = charging_manager._take_unpaid_rows(len(items))
             if allowed < len(items):
                 charging_manager._note_refused_default_dataset_items(len(items) - allowed)
@@ -2052,6 +2073,7 @@ async def _push_data_and_charge_one(
                         event_charge_limit_reached=True,
                     )
                 items = items[:allowed]
+            unpaid_past_limit = charging_manager._limit_reported()
 
         limited_count = len(items)
         if is_ppe and resolved_event:
@@ -2064,10 +2086,11 @@ async def _push_data_and_charge_one(
             )
 
         limited_items = items[:limited_count] if limited_count < len(items) else items
-        if is_ppe and is_default_dataset and limited_count < len(items):
-            # Rows beyond what the budget can pay for are dropped.
+        if is_ppe and limited_count < len(items):
+            # Rows beyond what the budget can pay for are dropped (any dataset).
             charging_manager._mark_charge_limit_hit(CHARGE_LIMIT_MAX_CHARGE)
-            charging_manager._note_refused_default_dataset_items(len(items) - limited_count)
+            if is_default_dataset:
+                charging_manager._note_refused_default_dataset_items(len(items) - limited_count)
 
         if not limited_items:
             return ChargeResult(
@@ -2570,7 +2593,7 @@ async def _push_data_with_charges_one(
         return ChargeResult(
             chargeable_within_limit=charging_manager.compute_chargeable(),
             charged_count=len(kept),
-            event_charge_limit_reached=len(kept) < len(rows_in) or charging_manager.is_charge_limit_reached(),
+            event_charge_limit_reached=len(kept) < len(rows_in) or charging_manager._limit_reported(),
             covered_counts=covered_counts(),
         )
 
@@ -2579,10 +2602,10 @@ async def _unpaid_push_locked(
     charging_manager: ChargingManager, rows: List[Dict[str, Any]], is_default_dataset: bool, push_fn: Any
 ) -> ChargeResult:
     """A push whose rows carry no priced event (caller holds the operation lock)."""
-    past_limit = charging_manager.is_charge_limit_reached()
     allowed = charging_manager._take_unpaid_rows(len(rows)) if is_default_dataset else len(rows)
     if allowed < len(rows):
         charging_manager._note_refused_default_dataset_items(len(rows) - allowed)
+    past_limit = charging_manager._limit_reported()
     if allowed > 0:
         await _gated_push(push_fn, rows[:allowed])
     return ChargeResult(

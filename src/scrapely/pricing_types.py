@@ -124,7 +124,12 @@ class ChargeResult(BaseModel):
     )
     event_charge_limit_reached: bool = Field(
         alias='eventChargeLimitReached',
-        description='If true, no more events of this type can be charged within the limit.'
+        description=(
+            'If true, a limit of the run (maxTotalChargeUsd, maxItems, the account balance) refused or '
+            'cut a charge or dropped rows, and no more events of this type can be charged: stop. A '
+            'charge accepted in full that leaves less than one more event of room reports False (the '
+            'next charge or push is refused and reports True); chargeable_within_limit tells the room left.'
+        )
     )
     covered_counts: Dict[str, int] = Field(
         default_factory=dict,
