@@ -206,6 +206,10 @@ def is_default_dataset_item_event(event_name: str) -> bool:
     return event_name in (APIFY_DEFAULT_DATASET_ITEM_EVENT, SCRAPELY_DEFAULT_DATASET_ITEM_EVENT)
 
 
+# The actor-start events the platform bills by itself (never an item the run saved).
+PLATFORM_START_EVENTS = frozenset({'scrapely-actor-start', 'apify-actor-start'})
+
+
 def resolve_default_dataset_item_event_name(pricing_info: dict) -> str:
     """Resolve the default dataset item event name from pricing info."""
     if APIFY_DEFAULT_DATASET_ITEM_EVENT in pricing_info:
@@ -591,7 +595,9 @@ class ChargingManager:
         if max_items is not None and any(
             count >= max_items
             for name, count in self._charged_events.items()
-            if not is_default_dataset_item_event(name) and self._per_event_prices.get(name, 0) > 0
+            if not is_default_dataset_item_event(name)
+            and name not in PLATFORM_START_EVENTS
+            and self._per_event_prices.get(name, 0) > 0
         ):
             return CHARGE_LIMIT_MAX_ITEMS
         if self._max_total_charge_usd is not None:
