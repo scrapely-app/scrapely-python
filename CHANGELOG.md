@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.51] - 2026-11-18
+
+- **A charged push that fails is always voided.** `Actor.push_data(items, charged_event_name)` and `push_data(rows, charges={...})` charge before the push; when the push then fails, its charge is now voided also when the outcome is unknown: a read timeout or dropped connection after sending, an error after a re-send that may have been stored, or the API's `503 push-outcome-unknown`. Before, the charge stood in those cases because the rows might be in the dataset. A user is now never charged for rows that may not have been stored; rows that were stored anyway are free. Pushes that succeed are charged exactly as before.
+
 ## [0.1.50] - 2026-11-13
 
 - **A charge accepted in full no longer reports the limit as reached.** `ChargeResult.event_charge_limit_reached` (from `Actor.charge()`, `Actor.push_data()` and `push_data(rows, charges={...})`) was `True` whenever the room left under `maxTotalChargeUsd` was below one more event, even when nothing had been refused. Actors stop on it and end with "stopped because the maximum charge for this run was reached", which the SDK words as "Stopped: reached the maximum charge you set ($0.05)", so a run that had saved everything it was asked for said it had been stopped by its maximum charge. It is now `True` only once the limit really refused or cut a charge or dropped rows; such a run ends with its own status message, and a run with more to do gets `True` from its next charge or push, which is refused. A charged push to a named dataset that the budget trims now also reports it. `chargeable_within_limit`, `calculate_max_event_charge_count_within_limit()` and `is_charge_limit_reached()` are unchanged. Charging is unchanged.

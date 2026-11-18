@@ -2319,11 +2319,10 @@ async def _push_data_and_charge_one(
                             accepted_for_items,
                             push_err,
                         )
-                        # Only when the push certainly stored nothing (the storage API
-                        # answered with an error, or the request was never sent). A
-                        # timeout after sending may have stored the items.
-                        if not _push_certainly_failed(push_err):
-                            raise
+                        # Every failed push is voided, also a timeout, a reset after
+                        # sending or an unknown outcome (_push_certainly_failed False):
+                        # the rows may be in the dataset, but a user is never charged
+                        # for rows that may not have been stored.
                         for i, ((name, _), op_id) in enumerate(zip(reserved_in_op, operation_ids)):
                             kept = min(accepted_for_items, results[i].charged_count)
                             if credit_used[i]:
@@ -2586,8 +2585,8 @@ async def _push_data_with_charges_one(
             await _gated_push(push_fn, kept)
         except Exception as push_err:
             logger.error('Dataset push failed after charges accepted (rows=%s): %s; voiding the charges', rows, push_err)
-            if _push_certainly_failed(push_err):
-                await undo(ops)
+            # Voided also when the outcome is unknown: never charge for rows that may not be stored.
+            await undo(ops)
             raise
         _log_atomic_refusal(shorts, len(rows_in), len(kept), given_back)
         return ChargeResult(
@@ -2651,6 +2650,7 @@ def _push_certainly_failed(err: BaseException) -> bool:
     resets after sending are not proof: the write may have landed,
     and neither is any error of a push one of whose earlier attempts may have been
     applied (``outcome_unknown``, set by the storage client's retries).
+    Charging does not use it: a failed push is voided either way.
     """
     import httpx
 
